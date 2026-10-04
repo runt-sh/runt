@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["crates/runt-proto", "crates/runt-net", "crates/runt-agent", "crates/runt-vmm", "crates/runt-cli"]
+members = ["crates/runt-proto", "crates/runt-net", "crates/runt-sandbox", "crates/runt-agent", "crates/runt-vmm", "crates/runt-cli"]
 
 [workspace.package]
 version = "0.0.1"
@@ -13,6 +13,7 @@ rust-version = "1.90"
 runt-proto = { path = "crates/runt-proto" }
 runt-vmm = { path = "crates/runt-vmm" }
 runt-net = { path = "crates/runt-net" }
+runt-sandbox = { path = "crates/runt-sandbox" }
 libc = "0.2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

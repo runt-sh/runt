@@ -17,3 +17,7 @@ RUN apt-get update \
  && find /usr/share/doc -mindepth 1 -not -name copyright -not -type d -delete \
  && rm -rf /usr/share/man/* /usr/share/info/* /usr/share/locale/*/ \
       /var/lib/apt/lists/* /var/cache/apt/*.bin /var/cache/debconf/*-old /var/log/apt /var/log/dpkg.log
+
+# Shared folders are owned by the host user while the VM runs as root; this
+# is a single-user dev VM, so trust every repository.
+RUN git config --system --add safe.directory '*'

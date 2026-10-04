@@ -6,7 +6,8 @@
 //!                                 upper.ext4   per-VM writable disk
 //!                                 console.log  guest console
 //!                                 vmm.log      supervisor stderr
-//! $XDG_RUNTIME_DIR/runt/<name>.sock            agent socket (libkrun listens)
+//! $XDG_RUNTIME_DIR/runt/<name>/agent.sock       agent socket (libkrun listens)
+//!                              ready.sock, events.sock, ports.json, sandbox.json
 //! $XDG_CACHE_HOME/runt/{vmlinux,initramfs.cpio,images/base.erofs}
 //! ```
 
@@ -87,22 +88,32 @@ pub fn vm_dir(name: &str) -> PathBuf {
 /// Sockets live under the runtime dir: short paths (unix sockets are limited
 /// to 108 bytes) on a tmpfs that is cleaned at logout.
 pub fn socket_path(name: &str) -> PathBuf {
-    runtime_dir().join(format!("{name}.sock"))
+    vm_runtime_dir(name).join("agent.sock")
 }
 
 /// Socket the CLI listens on during boot; the agent connects when ready.
 pub fn ready_socket_path(name: &str) -> PathBuf {
-    runtime_dir().join(format!("{name}.ready"))
+    vm_runtime_dir(name).join("ready.sock")
 }
 
 /// Socket the supervisor listens on for the agent's events (listening ports).
 pub fn events_socket_path(name: &str) -> PathBuf {
-    runtime_dir().join(format!("{name}.events"))
+    vm_runtime_dir(name).join("events.sock")
 }
 
 /// Current port forwards, written by the supervisor.
 pub fn ports_path(name: &str) -> PathBuf {
-    runtime_dir().join(format!("{name}.ports.json"))
+    vm_runtime_dir(name).join("ports.json")
+}
+
+/// What the supervisor's sandbox enforced, written at boot.
+pub fn sandbox_path(name: &str) -> PathBuf {
+    vm_runtime_dir(name).join("sandbox.json")
+}
+
+/// Per-VM runtime directory: each VM's sandbox is allowed only its own.
+pub fn vm_runtime_dir(name: &str) -> PathBuf {
+    runtime_dir().join(name)
 }
 
 fn runtime_dir() -> PathBuf {

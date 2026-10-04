@@ -104,6 +104,18 @@ enum Cmd {
     Port { vm: String },
     #[command(name = "__vmm", hide = true)]
     Vmm { name: String },
+    /// Apply a VM's sandbox to this process and try things it should and
+    /// shouldn't be able to do (for tests).
+    #[command(name = "__sandbox-check", hide = true)]
+    SandboxCheck {
+        name: String,
+        #[arg(long)]
+        read: Vec<std::path::PathBuf>,
+        #[arg(long)]
+        write: Vec<std::path::PathBuf>,
+        #[arg(long)]
+        connect: Vec<std::path::PathBuf>,
+    },
 }
 
 fn main() -> ExitCode {
@@ -154,6 +166,7 @@ fn run(cli: Cli) -> Result<i32> {
                 print_json(json!({
                     "name": rec.name, "status": "running", "cpus": rec.cpus,
                     "mem_mib": rec.mem_mib, "boot_ms": boot_ms, "mounts": rec.mounts,
+                    "sandbox": vm::SandboxStatus::read(&rec.name),
                 }));
             } else {
                 println!("{}", rec.name);
@@ -162,6 +175,7 @@ fn run(cli: Cli) -> Result<i32> {
                     eprintln!("mounted {} at {}{ro}", m.src.display(), m.dst.display());
                 }
                 eprintln!("booted in {boot_ms} ms; try `runt shell {}`", rec.name);
+                warn_if_unsandboxed(&rec.name);
             }
             Ok(0)
         }
@@ -201,11 +215,20 @@ fn run(cli: Cli) -> Result<i32> {
                 let items: Vec<_> = vms
                     .iter()
                     .map(|r| {
+                        // Runtime files only describe a VM that is running.
+                        let status = state::status(r);
+                        let running = status == Status::Running;
+                        let ports = if running {
+                            ports::read(&r.name)
+                        } else {
+                            vec![]
+                        };
                         json!({
-                            "name": r.name, "status": state::status(r), "cpus": r.cpus,
+                            "name": r.name, "status": status, "cpus": r.cpus,
                             "mem_mib": r.mem_mib, "created": r.created, "net": r.net,
                             "mounts": r.mounts,
-                            "ports": ports::read(&r.name).iter()
+                            "sandbox": running.then(|| vm::SandboxStatus::read(&r.name)).flatten(),
+                            "ports": ports.iter()
                                 .map(|m| json!({ "guest": m.guest, "host": m.host }))
                                 .collect::<Vec<_>>(),
                         })
@@ -284,6 +307,51 @@ fn run(cli: Cli) -> Result<i32> {
             }
             Ok(0)
         }
+        Cmd::SandboxCheck {
+            name,
+            read,
+            write,
+            connect,
+        } => {
+            let rec = state::load(&name)?;
+            let assets = state::assets()?;
+            let policy = vm::sandbox_policy(&rec, &assets, &state::vm_dir(&name));
+            let status = runt_sandbox::apply(&policy)?;
+            let outcome = |r: std::io::Result<()>| match r {
+                Ok(()) => "allowed".to_string(),
+                Err(e) => format!("denied: {e}"),
+            };
+            let mut results = serde_json::Map::new();
+            for p in read {
+                let r = std::fs::read(&p).map(drop);
+                results.insert(format!("read {}", p.display()), json!(outcome(r)));
+            }
+            for p in write {
+                let r = std::fs::write(&p, b"x");
+                results.insert(format!("write {}", p.display()), json!(outcome(r)));
+            }
+            for p in connect {
+                let r = std::os::unix::net::UnixStream::connect(&p).map(drop);
+                results.insert(format!("connect {}", p.display()), json!(outcome(r)));
+            }
+            let r = std::process::Command::new("/bin/true").status().map(drop);
+            results.insert("exec /bin/true".into(), json!(outcome(r)));
+            // SAFETY: unshare(2) with a flag constant.
+            let rc = unsafe { libc::unshare(libc::CLONE_NEWUSER) };
+            let r = if rc == 0 {
+                Ok(())
+            } else {
+                Err(std::io::Error::last_os_error())
+            };
+            results.insert("unshare user namespace".into(), json!(outcome(r)));
+            print_json(json!({
+                "landlock": status.landlock.as_str(),
+                "landlock_abi": status.landlock_abi,
+                "seccomp": status.seccomp,
+                "results": results,
+            }));
+            Ok(0)
+        }
         Cmd::Vmm { name } => vm::supervise(&name).map(|()| 0),
     }
 }
@@ -351,6 +419,19 @@ fn report(json: bool, name: &str, status: Status, boot_ms: Option<u128>) {
         eprintln!("{name}: {} ({ms} ms)", status.as_str());
     } else {
         eprintln!("{name}: {}", status.as_str());
+    }
+}
+
+/// Tell humans when the VM's host process couldn't be confined.
+fn warn_if_unsandboxed(name: &str) {
+    match vm::SandboxStatus::read(name) {
+        Some(s) if s.landlock == "full" && s.seccomp => {}
+        Some(s) => eprintln!(
+            "runt: warning: the VM's host process is only partly sandboxed \
+             (landlock: {}, seccomp: {}); a newer kernel enables full isolation",
+            s.landlock, s.seccomp
+        ),
+        None => eprintln!("runt: warning: unknown sandbox status for the VM's host process"),
     }
 }
 

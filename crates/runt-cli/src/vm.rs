@@ -2,6 +2,7 @@
 
 use std::fs::{self, File, OpenOptions};
 use std::os::fd::AsRawFd;
+use std::os::unix::fs::DirBuilderExt;
 use std::os::unix::net::UnixListener;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
@@ -108,14 +109,17 @@ pub fn start(rec: &mut VmRecord) -> Result<u128> {
     runt_vmm::probe().map_err(|e| CliError::new("libkrun_missing", e.to_string()))?;
     let dir = state::vm_dir(&rec.name);
     let sock = state::socket_path(&rec.name);
-    if let Some(parent) = sock.parent() {
-        fs::create_dir_all(parent)?;
-    }
-    state::remove_socket(&sock);
+    // A fresh, private runtime dir per boot: the VM's sandbox is granted
+    // exactly this directory.
+    let rt = state::vm_runtime_dir(&rec.name);
+    let _ = fs::remove_dir_all(&rt);
+    fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(&rt)?;
     let _ = fs::remove_file(dir.join("console.log"));
 
     let ready_path = state::ready_socket_path(&rec.name);
-    state::remove_socket(&ready_path);
     let ready = UnixListener::bind(&ready_path)?;
 
     let log = OpenOptions::new()
@@ -205,11 +209,18 @@ pub fn supervise(name: &str) -> Result<()> {
     let rec = state::load(name)?;
     let assets = state::assets()?;
     let dir = state::vm_dir(name);
+
+    // Everything that needs the wider filesystem happens before we confine
+    // ourselves: load libkrun (and its libraries), read the host's resolver.
+    runt_vmm::probe().map_err(|e| CliError::new("libkrun_missing", e.to_string()))?;
+    let dns = runt_net::host_resolver();
+    confine(&rec, &assets, &dir);
+
     let mut cmdline = format!("console=hvc0 quiet panic=-1 runt.name={name}");
     // Lives as long as this process, which is as long as the VM.
     let net = match rec.net {
         NetMode::Nat => {
-            let net = runt_net::start(None).map_err(|e| {
+            let net = runt_net::start(dns).map_err(|e| {
                 CliError::new("net_failed", format!("cannot start networking: {e}"))
             })?;
             cmdline.push(' ');
@@ -283,6 +294,65 @@ pub fn supervise(name: &str) -> Result<()> {
     }
 }
 
+/// Confine this (supervisor) process to what the VM needs, and record what
+/// was enforced for `runt ls`. Best effort: an unsupported kernel leaves the
+/// VM running unconfined, with a warning.
+fn confine(rec: &VmRecord, assets: &state::Assets, dir: &Path) {
+    let status = match runt_sandbox::apply(&sandbox_policy(rec, assets, dir)) {
+        Ok(s) => SandboxStatus {
+            landlock: s.landlock.as_str().into(),
+            landlock_abi: s.landlock_abi,
+            seccomp: s.seccomp,
+        },
+        Err(e) => {
+            eprintln!("runt: warning: cannot sandbox the VM process: {e}");
+            SandboxStatus::default()
+        }
+    };
+    eprintln!(
+        "runt: sandbox: landlock={} (abi {}), seccomp={}",
+        status.landlock, status.landlock_abi, status.seccomp
+    );
+    let _ = fs::write(
+        state::sandbox_path(&rec.name),
+        serde_json::to_vec(&status).unwrap(),
+    );
+}
+
+/// Everything a VM's process may touch: its own state and runtime dirs, its
+/// kernel and image, /dev/kvm, and the folders the user shared.
+pub fn sandbox_policy(rec: &VmRecord, assets: &state::Assets, dir: &Path) -> runt_sandbox::Policy {
+    let (rw_shares, ro_shares): (Vec<&Mount>, Vec<&Mount>) =
+        rec.mounts.iter().partition(|m| !m.read_only);
+    let mut rw_dirs = vec![dir.to_path_buf(), state::vm_runtime_dir(&rec.name)];
+    rw_dirs.extend(rw_shares.iter().map(|m| m.src.clone()));
+    runt_sandbox::Policy {
+        read_files: vec![
+            assets.kernel.clone(),
+            assets.initramfs.clone(),
+            assets.image.clone(),
+        ],
+        rw_dirs,
+        ro_dirs: ro_shares.iter().map(|m| m.src.clone()).collect(),
+        devices: vec![PathBuf::from("/dev/kvm")],
+    }
+}
+
+/// What the supervisor's sandbox enforced (see `runt_sandbox::Status`).
+#[derive(Debug, Default, serde::Serialize, serde::Deserialize)]
+pub struct SandboxStatus {
+    /// "full", "partial" or "none".
+    pub landlock: String,
+    pub landlock_abi: i32,
+    pub seccomp: bool,
+}
+
+impl SandboxStatus {
+    pub fn read(name: &str) -> Option<SandboxStatus> {
+        serde_json::from_slice(&fs::read(state::sandbox_path(name)).ok()?).ok()
+    }
+}
+
 pub fn stop(rec: &mut VmRecord, force: bool) -> Result<()> {
     let Some(pid) = rec.pid.filter(|_| state::status(rec) == Status::Running) else {
         rec.pid = None;
@@ -308,9 +378,7 @@ pub fn stop(rec: &mut VmRecord, force: bool) -> Result<()> {
             thread::sleep(Duration::from_millis(20));
         }
     }
-    state::remove_socket(&sock);
-    state::remove_socket(&state::events_socket_path(&rec.name));
-    ports::clear(&rec.name);
+    let _ = fs::remove_dir_all(state::vm_runtime_dir(&rec.name));
     rec.pid = None;
     state::save(rec)?;
     Ok(())
@@ -329,7 +397,7 @@ pub fn remove(name: &str, force: bool) -> Result<()> {
         stop(&mut rec, true)?;
     }
     fs::remove_dir_all(state::vm_dir(name))?;
-    state::remove_socket(&state::socket_path(name));
+    let _ = fs::remove_dir_all(state::vm_runtime_dir(name));
     Ok(())
 }
 
