@@ -1,0 +1,10 @@
+[package]
+name = "runt-vmm"
+description = "VM backends for runt (libkrun)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+libc.workspace = true
