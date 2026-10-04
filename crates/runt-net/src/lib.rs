@@ -98,7 +98,7 @@ pub fn start(upstream_dns: Option<Ipv4Addr>) -> io::Result<Net> {
 /// The host's DNS server. A loopback stub (systemd-resolved's 127.0.0.53) is
 /// fine: the DNS relay queries it from the host, not from the guest, and the
 /// stub knows the host's VPN routing domains.
-fn host_resolver() -> Option<Ipv4Addr> {
+pub fn host_resolver() -> Option<Ipv4Addr> {
     first_ipv4_nameserver(&fs::read_to_string("/etc/resolv.conf").ok()?)
 }
 

@@ -14,6 +14,7 @@ path = "src/main.rs"
 runt-proto.workspace = true
 runt-vmm.workspace = true
 runt-net.workspace = true
+runt-sandbox.workspace = true
 libc.workspace = true
 serde.workspace = true
 serde_json.workspace = true

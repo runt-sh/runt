@@ -1,0 +1,11 @@
+[package]
+name = "runt-sandbox"
+description = "Confines a runt VM's host process (landlock + seccomp)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+libc.workspace = true
+landlock = "0.4.7"

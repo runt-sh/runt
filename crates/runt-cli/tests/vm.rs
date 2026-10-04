@@ -291,3 +291,71 @@ fn shared_folders() {
     drop(vm);
     let _ = std::fs::remove_dir_all(&base);
 }
+
+#[test]
+#[ignore]
+fn vm_process_is_sandboxed() {
+    let base = std::env::temp_dir().join(format!("runt-test-sandbox-{}", std::process::id()));
+    let share = base.join("share");
+    std::fs::create_dir_all(&share).unwrap();
+    let outside = base.join("outside.txt");
+    std::fs::write(&outside, "secret").unwrap();
+
+    let a = format!("test-sba-{}", std::process::id());
+    let o = Command::new(env!("CARGO_BIN_EXE_runt"))
+        .args(["new", &a, "--json", "--mem", "512M", "--mount"])
+        .arg(&share)
+        .output()
+        .unwrap();
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+    let new: serde_json::Value = serde_json::from_slice(&o.stdout).unwrap();
+    let a = Vm(a);
+    let b = Vm::new("sbb");
+    if new["sandbox"]["landlock"] != "full" {
+        eprintln!("skipping: kernel lacks full Landlock ({})", new["sandbox"]);
+        return;
+    }
+    assert_eq!(new["sandbox"]["seccomp"], true);
+
+    let rt = |vm: &Vm| {
+        let dir = std::env::var("XDG_RUNTIME_DIR").unwrap();
+        std::path::PathBuf::from(dir)
+            .join("runt")
+            .join(&vm.0)
+            .join("agent.sock")
+    };
+    let o = Command::new(env!("CARGO_BIN_EXE_runt"))
+        .args(["__sandbox-check", &a.0])
+        .arg("--read")
+        .arg(&outside)
+        .arg("--write")
+        .arg(share.join("ok.txt"))
+        .arg("--write")
+        .arg(base.join("nope.txt"))
+        .arg("--connect")
+        .arg(rt(&a))
+        .arg("--connect")
+        .arg(rt(&b))
+        .output()
+        .unwrap();
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+    let v: serde_json::Value = serde_json::from_slice(&o.stdout).unwrap();
+    let r = &v["results"];
+    let denied = |k: String| {
+        let s = r[&k]
+            .as_str()
+            .unwrap_or_else(|| panic!("no result for {k}: {v}"));
+        assert!(s.starts_with("denied"), "{k} should be denied: {s}");
+    };
+    let allowed = |k: String| assert_eq!(r[&k], "allowed", "{k} should be allowed");
+    denied(format!("read {}", outside.display()));
+    allowed(format!("write {}", share.join("ok.txt").display()));
+    denied(format!("write {}", base.join("nope.txt").display()));
+    allowed(format!("connect {}", rt(&a).display()));
+    denied(format!("connect {}", rt(&b).display()));
+    denied("exec /bin/true".into());
+    denied("unshare user namespace".into());
+
+    drop((a, b));
+    let _ = std::fs::remove_dir_all(&base);
+}
