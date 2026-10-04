@@ -49,6 +49,15 @@ enum Cmd {
         /// Networking: nat (outbound internet) or none (fully offline)
         #[arg(long, value_enum, default_value_t = state::NetMode::Nat)]
         net: state::NetMode,
+        /// Only allow outbound connections to this domain (exact name),
+        /// '*.domain' (any subdomain) or IPv4 address/network. Repeatable.
+        /// Default: the whole public internet.
+        #[arg(long = "allow", value_name = "DOMAIN|IP[/LEN]")]
+        allow: Vec<String>,
+        /// Also allow private networks around this machine (LAN, Tailscale;
+        /// never this machine's own loopback)
+        #[arg(long)]
+        allow_lan: bool,
         /// Share a host directory: SRC[:DST][:ro]. DST defaults to the same
         /// path as on the host. Repeatable.
         #[arg(short = 'm', long = "mount", value_name = "SRC[:DST][:ro]")]
@@ -97,7 +106,12 @@ enum Cmd {
         force: bool,
     },
     /// Print a VM's console log
-    Logs { vm: String },
+    Logs {
+        vm: String,
+        /// Show connections and DNS lookups the VM's network policy refused
+        #[arg(long)]
+        egress: bool,
+    },
     /// List ports forwarded from a VM to this machine (automatic: any port
     /// the guest listens on appears on 127.0.0.1)
     #[command(alias = "ports")]
@@ -138,6 +152,8 @@ fn run(cli: Cli) -> Result<i32> {
             cpus,
             mem,
             net,
+            allow,
+            allow_lan,
             mounts,
         } => {
             let name = match name {
@@ -154,7 +170,8 @@ fn run(cli: Cli) -> Result<i32> {
             {
                 eprintln!("runt: warning: sharing your entire home directory with the VM");
             }
-            let mut rec = vm::create(&name, cpus, mem, net, mounts)?;
+            let egress = state::Egress::new(&allow, allow_lan)?;
+            let mut rec = vm::create(&name, cpus, mem, net, egress, mounts)?;
             let boot_ms = match vm::start(&mut rec) {
                 Ok(ms) => ms,
                 Err(e) => {
@@ -166,6 +183,7 @@ fn run(cli: Cli) -> Result<i32> {
                 print_json(json!({
                     "name": rec.name, "status": "running", "cpus": rec.cpus,
                     "mem_mib": rec.mem_mib, "boot_ms": boot_ms, "mounts": rec.mounts,
+                    "egress": egress_json(&rec),
                     "sandbox": vm::SandboxStatus::read(&rec.name),
                 }));
             } else {
@@ -173,6 +191,9 @@ fn run(cli: Cli) -> Result<i32> {
                 for m in &rec.mounts {
                     let ro = if m.read_only { " (read-only)" } else { "" };
                     eprintln!("mounted {} at {}{ro}", m.src.display(), m.dst.display());
+                }
+                if let Some(e) = egress_summary(&rec) {
+                    eprintln!("network: {e}");
                 }
                 eprintln!("booted in {boot_ms} ms; try `runt shell {}`", rec.name);
                 warn_if_unsandboxed(&rec.name);
@@ -226,7 +247,7 @@ fn run(cli: Cli) -> Result<i32> {
                         json!({
                             "name": r.name, "status": status, "cpus": r.cpus,
                             "mem_mib": r.mem_mib, "created": r.created, "net": r.net,
-                            "mounts": r.mounts,
+                            "mounts": r.mounts, "egress": egress_json(r),
                             "sandbox": running.then(|| vm::SandboxStatus::read(&r.name)).flatten(),
                             "ports": ports.iter()
                                 .map(|m| json!({ "guest": m.guest, "host": m.host }))
@@ -274,7 +295,21 @@ fn run(cli: Cli) -> Result<i32> {
             }
             Ok(0)
         }
-        Cmd::Logs { vm: name } => {
+        Cmd::Logs {
+            vm: name,
+            egress: true,
+        } => {
+            state::load(&name)?;
+            let log = std::fs::read_to_string(state::egress_log_path(&name)).unwrap_or_default();
+            if json {
+                let items: Vec<_> = log.lines().filter_map(parse_denial).collect();
+                print_json(json!({ "name": name, "denied": items }));
+            } else {
+                print!("{log}");
+            }
+            Ok(0)
+        }
+        Cmd::Logs { vm: name, .. } => {
             state::load(&name)?;
             let log = std::fs::read(vm::console_log(&name)).unwrap_or_default();
             if json {
@@ -477,6 +512,45 @@ fn parse_mem(s: &str) -> std::result::Result<u32, String> {
     Ok(mib)
 }
 
+/// `null` for offline VMs; otherwise what the network may reach.
+fn egress_json(rec: &state::VmRecord) -> serde_json::Value {
+    if rec.net == state::NetMode::None {
+        return serde_json::Value::Null;
+    }
+    json!({
+        "internet": if rec.egress.allow.is_empty() { "all" } else { "allowlist" },
+        "allow": rec.egress.allow,
+        "lan": rec.egress.lan,
+    })
+}
+
+/// One line for humans, when the policy isn't the default.
+fn egress_summary(rec: &state::VmRecord) -> Option<String> {
+    let e = &rec.egress;
+    if rec.net == state::NetMode::None || e.is_default() {
+        return None;
+    }
+    let mut parts = Vec::new();
+    if !e.allow.is_empty() {
+        parts.push(format!("only {}", e.allow.join(", ")));
+    } else {
+        parts.push("internet".into());
+    }
+    if e.lan {
+        parts.push("LAN".into());
+    }
+    Some(parts.join(" + "))
+}
+
+/// `[2026-10-04T12:00:00Z]: egress policy denied connect to 1.2.3.4:443`
+fn parse_denial(line: &str) -> Option<serde_json::Value> {
+    let (time, rest) = line.strip_prefix('[')?.split_once("]: ")?;
+    let rest = rest.strip_prefix("egress policy denied ")?;
+    let (op, dest) = rest.split_once(' ')?;
+    let dest = dest.strip_prefix("to ").unwrap_or(dest);
+    Some(json!({ "time": time, "op": op, "dest": dest }))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -500,5 +574,17 @@ mod tests {
     fn cli_is_well_formed() {
         use clap::CommandFactory;
         Cli::command().debug_assert();
+    }
+
+    #[test]
+    fn parses_denials() {
+        let v = parse_denial("[2026-10-04T06:18:29Z]: egress policy denied connect to 1.1.1.1:80")
+            .unwrap();
+        assert_eq!(v["op"], "connect");
+        assert_eq!(v["dest"], "1.1.1.1:80");
+        assert_eq!(v["time"], "2026-10-04T06:18:29Z");
+        let v = parse_denial("[t]: egress policy denied resolve example.com").unwrap();
+        assert_eq!(v["dest"], "example.com");
+        assert!(parse_denial("garbage").is_none());
     }
 }
