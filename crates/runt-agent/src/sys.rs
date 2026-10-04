@@ -65,6 +65,29 @@ pub fn vsock_listen(port: u32) -> io::Result<OwnedFd> {
     }
 }
 
+/// Connect to a vsock port on the host.
+pub fn vsock_connect_host(port: u32) -> io::Result<OwnedFd> {
+    // SAFETY: plain socket/connect with a correctly sized sockaddr_vm.
+    unsafe {
+        let fd = cvt(libc::socket(
+            libc::AF_VSOCK,
+            libc::SOCK_STREAM | libc::SOCK_CLOEXEC,
+            0,
+        ))?;
+        let fd = OwnedFd::from_raw_fd(fd);
+        let mut addr: libc::sockaddr_vm = std::mem::zeroed();
+        addr.svm_family = libc::AF_VSOCK as libc::sa_family_t;
+        addr.svm_port = port;
+        addr.svm_cid = libc::VMADDR_CID_HOST;
+        cvt(libc::connect(
+            fd.as_raw_fd(),
+            (&addr as *const libc::sockaddr_vm).cast(),
+            size_of::<libc::sockaddr_vm>() as libc::socklen_t,
+        ))?;
+        Ok(fd)
+    }
+}
+
 pub fn accept(listener: &OwnedFd) -> io::Result<File> {
     loop {
         // SAFETY: accept4 with null address is valid.

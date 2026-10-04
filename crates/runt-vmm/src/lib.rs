@@ -23,9 +23,8 @@ pub struct VmConfig {
     pub cmdline: String,
     /// Block devices in order: the guest sees them as vda, vdb, ...
     pub disks: Vec<Disk>,
-    /// Guest vsock port, and the host unix socket libkrun listens on for it.
-    pub vsock_port: u32,
-    pub vsock_socket: PathBuf,
+    /// vsock ports bridged to host unix sockets.
+    pub vsock_ports: Vec<VsockPort>,
     /// File the guest console is written to.
     pub console_log: PathBuf,
 }
@@ -35,6 +34,17 @@ pub struct Disk {
     pub id: String,
     pub path: PathBuf,
     pub read_only: bool,
+}
+
+/// A guest vsock port bridged to a host unix socket.
+#[derive(Debug, Clone)]
+pub struct VsockPort {
+    pub port: u32,
+    pub socket: PathBuf,
+    /// True: libkrun listens on `socket` and forwards host connections to a
+    /// guest listening on `port`. False: the guest connects out to `port` and
+    /// libkrun connects to a host process listening on `socket`.
+    pub host_connects: bool,
 }
 
 #[derive(Debug)]
@@ -146,7 +156,11 @@ pub fn run(cfg: &VmConfig) -> Result<std::convert::Infallible, Error> {
     let kernel = cstr(&cfg.kernel)?;
     let initramfs = cstr(&cfg.initramfs)?;
     let cmdline = CString::new(cfg.cmdline.as_str()).map_err(|_| Error("bad cmdline".into()))?;
-    let sock = cstr(&cfg.vsock_socket)?;
+    let ports: Vec<(u32, CString, bool)> = cfg
+        .vsock_ports
+        .iter()
+        .map(|p| Ok((p.port, cstr(&p.socket)?, p.host_connects)))
+        .collect::<Result<_, Error>>()?;
     let console = cstr(&cfg.console_log)?;
     let disks: Vec<(CString, CString, bool)> = cfg
         .disks
@@ -189,10 +203,12 @@ pub fn run(cfg: &VmConfig) -> Result<std::convert::Infallible, Error> {
         // vsock without TSI: the guest gets no implicit host socket access.
         check("disable_implicit_vsock", (k.disable_implicit_vsock)(ctx))?;
         check("add_vsock", (k.add_vsock)(ctx, 0))?;
-        check(
-            "add_vsock_port2",
-            (k.add_vsock_port2)(ctx, cfg.vsock_port, sock.as_ptr(), true),
-        )?;
+        for (port, sock, host_connects) in &ports {
+            check(
+                "add_vsock_port2",
+                (k.add_vsock_port2)(ctx, *port, sock.as_ptr(), *host_connects),
+            )?;
+        }
         check(
             "set_console_output",
             (k.set_console_output)(ctx, console.as_ptr()),

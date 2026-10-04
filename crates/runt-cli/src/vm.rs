@@ -1,9 +1,11 @@
 //! VM lifecycle: create, start (spawning the supervisor), stop, remove.
 
 use std::fs::{self, File, OpenOptions};
+use std::os::fd::AsRawFd;
+use std::os::unix::net::UnixListener;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::{Child, Command, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -98,6 +100,10 @@ pub fn start(rec: &mut VmRecord) -> Result<u128> {
     state::remove_socket(&sock);
     let _ = fs::remove_file(dir.join("console.log"));
 
+    let ready_path = state::ready_socket_path(&rec.name);
+    state::remove_socket(&ready_path);
+    let ready = UnixListener::bind(&ready_path)?;
+
     let log = OpenOptions::new()
         .create(true)
         .append(true)
@@ -121,31 +127,51 @@ pub fn start(rec: &mut VmRecord) -> Result<u128> {
     rec.pid = Some(child.id());
     state::save(rec)?;
 
+    let result = wait_ready(&ready, &mut child, t0);
+    drop(ready);
+    state::remove_socket(&state::ready_socket_path(&rec.name));
+    match result {
+        Ok(()) => {
+            // The agent is serving; confirm with a real handshake.
+            client::connect(&rec.name, &sock)?;
+            Ok(t0.elapsed().as_millis())
+        }
+        Err(why) => {
+            if child.try_wait().ok().flatten().is_none() {
+                // SAFETY: plain kill(2) on our own child.
+                unsafe { libc::kill(child.id() as libc::pid_t, libc::SIGKILL) };
+                let _ = child.wait();
+            }
+            rec.pid = None;
+            state::save(rec)?;
+            Err(boot_failed(&rec.name, &why))
+        }
+    }
+}
+
+/// Wait for the agent to connect to the ready socket, the VM to die, or the
+/// boot timeout, whichever comes first.
+fn wait_ready(
+    ready: &UnixListener,
+    child: &mut Child,
+    t0: Instant,
+) -> std::result::Result<(), String> {
     loop {
-        if let Some(conn) = client::try_connect(&sock, Duration::from_millis(250)) {
-            drop(conn);
-            return Ok(t0.elapsed().as_millis());
+        let mut pfd = libc::pollfd {
+            fd: ready.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        // SAFETY: one valid pollfd.
+        if unsafe { libc::poll(&mut pfd, 1, 20) } > 0 && ready.accept().is_ok() {
+            return Ok(());
         }
         if let Ok(Some(st)) = child.try_wait() {
-            rec.pid = None;
-            state::save(rec)?;
-            return Err(boot_failed(
-                &rec.name,
-                &format!("the VM exited during boot ({st})"),
-            ));
+            return Err(format!("the VM exited during boot ({st})"));
         }
         if t0.elapsed() > BOOT_TIMEOUT {
-            // SAFETY: plain kill(2) on our own child.
-            unsafe { libc::kill(child.id() as libc::pid_t, libc::SIGKILL) };
-            let _ = child.wait();
-            rec.pid = None;
-            state::save(rec)?;
-            return Err(boot_failed(
-                &rec.name,
-                "timed out waiting for the VM to boot",
-            ));
+            return Err("timed out waiting for the VM to boot".into());
         }
-        thread::sleep(Duration::from_millis(5));
     }
 }
 
@@ -182,8 +208,18 @@ pub fn supervise(name: &str) -> Result<()> {
                 read_only: false,
             },
         ],
-        vsock_port: runt_proto::AGENT_PORT,
-        vsock_socket: state::socket_path(name),
+        vsock_ports: vec![
+            runt_vmm::VsockPort {
+                port: runt_proto::AGENT_PORT,
+                socket: state::socket_path(name),
+                host_connects: true,
+            },
+            runt_vmm::VsockPort {
+                port: runt_proto::READY_PORT,
+                socket: state::ready_socket_path(name),
+                host_connects: false,
+            },
+        ],
         console_log: dir.join("console.log"),
     };
     match runt_vmm::run(&cfg) {

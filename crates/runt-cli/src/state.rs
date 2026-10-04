@@ -72,12 +72,20 @@ pub fn vm_dir(name: &str) -> PathBuf {
 /// Sockets live under the runtime dir: short paths (unix sockets are limited
 /// to 108 bytes) on a tmpfs that is cleaned at logout.
 pub fn socket_path(name: &str) -> PathBuf {
-    let base = match std::env::var_os("XDG_RUNTIME_DIR") {
+    runtime_dir().join(format!("{name}.sock"))
+}
+
+/// Socket the CLI listens on during boot; the agent connects when ready.
+pub fn ready_socket_path(name: &str) -> PathBuf {
+    runtime_dir().join(format!("{name}.ready"))
+}
+
+fn runtime_dir() -> PathBuf {
+    match std::env::var_os("XDG_RUNTIME_DIR") {
         Some(v) if !v.is_empty() => PathBuf::from(v).join("runt"),
         // SAFETY: getuid never fails.
         _ => PathBuf::from(format!("/tmp/runt-{}", unsafe { libc::getuid() })),
-    };
-    base.join(format!("{name}.sock"))
+    }
 }
 
 pub struct Assets {

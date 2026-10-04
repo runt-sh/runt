@@ -31,15 +31,14 @@ fn main() {
         initramfs: PathBuf::from(&a[1]),
         cmdline: std::env::var("CMDLINE").unwrap_or_else(|_| "console=hvc0 panic=-1".into()),
         disks,
-        vsock_port: runt_proto_port(),
-        vsock_socket: std::env::temp_dir().join("runt-boot.sock"),
+        vsock_ports: vec![runt_vmm::VsockPort {
+            port: 1024,
+            socket: std::env::temp_dir().join("runt-boot.sock"),
+            host_connects: true,
+        }],
         console_log: PathBuf::from(&a[2]),
     };
     let err = runt_vmm::run(&cfg).unwrap_err();
     eprintln!("boot: {err}");
     std::process::exit(1);
-}
-
-fn runt_proto_port() -> u32 {
-    1024
 }

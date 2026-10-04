@@ -30,6 +30,9 @@ fn main() {
         Err(e) => fatal(&format!("cannot listen on vsock: {e}")),
     };
     eprintln!("runt-agent: ready");
+    // Tell the host we're serving. Nobody may be listening (e.g. after a
+    // guest reboot), which is fine.
+    drop(sys::vsock_connect_host(runt_proto::READY_PORT));
     loop {
         match sys::accept(&listener) {
             Ok(conn) => {

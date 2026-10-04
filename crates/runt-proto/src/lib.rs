@@ -25,6 +25,10 @@ pub const VERSION: u32 = 0;
 /// Guest vsock port runt-agent listens on.
 pub const AGENT_PORT: u32 = 1024;
 
+/// Host vsock port runt-agent connects to once it is ready to serve. The
+/// host listens there so boot completion is an event, not a poll.
+pub const READY_PORT: u32 = 1025;
+
 /// Control stream.
 pub const CTRL: u32 = 0;
 /// Exec stdin (client -> agent).
