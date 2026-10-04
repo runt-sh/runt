@@ -1,0 +1,22 @@
+[package]
+name = "runt"
+description = "Tiny, fast microVMs for agents and humans, local and in the cloud"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "runt"
+path = "src/main.rs"
+
+[dependencies]
+runt-proto.workspace = true
+runt-vmm.workspace = true
+libc.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+clap.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true
