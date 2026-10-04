@@ -11,6 +11,7 @@ use std::io;
 use std::os::unix::fs::DirBuilderExt;
 use std::path::Path;
 
+use crate::net::NetConfig;
 use crate::sys::{self, cvt};
 
 const LOWER: &str = "/mnt/lower";
@@ -21,17 +22,17 @@ const ROOT: &str = "/mnt/root";
 #[derive(Debug, Default)]
 pub struct Cmdline {
     pub name: Option<String>,
+    /// Static network config; None means the VM has no network.
+    pub net: Option<NetConfig>,
 }
 
 impl Cmdline {
     fn parse(s: &str) -> Cmdline {
-        let mut c = Cmdline::default();
-        for word in s.split_whitespace() {
-            if let Some(v) = word.strip_prefix("runt.name=") {
-                c.name = Some(v.to_string());
-            }
+        let get = |key: &str| s.split_whitespace().find_map(|w| w.strip_prefix(key));
+        Cmdline {
+            name: get("runt.name=").map(String::from),
+            net: NetConfig::parse(get("runt.ip="), get("runt.gw="), get("runt.dns=")),
         }
-        c
     }
 }
 
@@ -91,6 +92,11 @@ pub fn early() -> io::Result<Cmdline> {
     }
     if let Err(e) = sys::loopback_up() {
         eprintln!("runt-agent: warning: cannot bring up lo: {e}");
+    }
+    if let Some(net) = &cmdline.net
+        && let Err(e) = crate::net::configure(net, cmdline.name.as_deref())
+    {
+        eprintln!("runt-agent: warning: network setup failed: {e}");
     }
     Ok(cmdline)
 }
@@ -189,5 +195,11 @@ mod tests {
         let c = Cmdline::parse("console=hvc0 runt.name=brave-shrew panic=-1");
         assert_eq!(c.name.as_deref(), Some("brave-shrew"));
         assert!(Cmdline::parse("console=hvc0").name.is_none());
+        let c = Cmdline::parse("runt.ip=100.96.0.2/30 runt.gw=100.96.0.1 runt.dns=100.96.0.1");
+        assert_eq!(
+            c.net.unwrap().gateway,
+            std::net::Ipv4Addr::new(100, 96, 0, 1)
+        );
+        assert!(Cmdline::parse("runt.name=x").net.is_none());
     }
 }

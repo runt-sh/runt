@@ -11,6 +11,7 @@
 
 use std::ffi::{CStr, CString, c_char, c_void};
 use std::fmt;
+use std::os::fd::RawFd;
 use std::path::PathBuf;
 
 /// Everything needed to boot one VM.
@@ -27,6 +28,19 @@ pub struct VmConfig {
     pub vsock_ports: Vec<VsockPort>,
     /// File the guest console is written to.
     pub console_log: PathBuf,
+    /// virtio-net device (eth0), if the VM has networking.
+    pub net: Option<NetDevice>,
+}
+
+/// A virtio-net device backed by a unixstream userspace network proxy
+/// (4-byte big-endian length + ethernet frame).
+#[derive(Debug, Clone)]
+pub struct NetDevice {
+    /// Connected socket to the proxy. libkrun takes ownership.
+    pub fd: RawFd,
+    pub mac: [u8; 6],
+    /// virtio-net feature bits (offloads); 0 means plain 1500-byte frames.
+    pub features: u32,
 }
 
 #[derive(Debug, Clone)]
@@ -71,6 +85,7 @@ struct Krun {
     add_vsock: unsafe extern "C" fn(u32, u32) -> i32,
     add_vsock_port2: unsafe extern "C" fn(u32, u32, *const c_char, bool) -> i32,
     set_console_output: unsafe extern "C" fn(u32, *const c_char) -> i32,
+    add_net_unixstream: unsafe extern "C" fn(u32, *const c_char, i32, *const u8, u32, u32) -> i32,
     start_enter: unsafe extern "C" fn(u32) -> i32,
 }
 
@@ -97,6 +112,7 @@ impl Krun {
                 add_vsock: sym(h, "krun_add_vsock")?,
                 add_vsock_port2: sym(h, "krun_add_vsock_port2")?,
                 set_console_output: sym(h, "krun_set_console_output")?,
+                add_net_unixstream: sym(h, "krun_add_net_unixstream")?,
                 start_enter: sym(h, "krun_start_enter")?,
             })
         }
@@ -198,6 +214,19 @@ pub fn run(cfg: &VmConfig) -> Result<std::convert::Infallible, Error> {
             check(
                 "add_disk",
                 (k.add_disk)(ctx, id.as_ptr(), path.as_ptr(), *ro),
+            )?;
+        }
+        if let Some(net) = &cfg.net {
+            check(
+                "add_net_unixstream",
+                (k.add_net_unixstream)(
+                    ctx,
+                    std::ptr::null(),
+                    net.fd,
+                    net.mac.as_ptr(),
+                    net.features,
+                    0,
+                ),
             )?;
         }
         // vsock without TSI: the guest gets no implicit host socket access.

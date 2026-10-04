@@ -3,6 +3,7 @@
 mod client;
 mod error;
 mod names;
+mod ports;
 mod state;
 mod term;
 mod vm;
@@ -44,6 +45,9 @@ enum Cmd {
         /// Memory, e.g. 512M or 2G
         #[arg(long, default_value = "1G", value_parser = parse_mem)]
         mem: u32,
+        /// Networking: nat (outbound internet) or none (fully offline)
+        #[arg(long, value_enum, default_value_t = state::NetMode::Nat)]
+        net: state::NetMode,
     },
     /// Run a command in a VM
     #[command(trailing_var_arg = true)]
@@ -89,6 +93,10 @@ enum Cmd {
     },
     /// Print a VM's console log
     Logs { vm: String },
+    /// List ports forwarded from a VM to this machine (automatic: any port
+    /// the guest listens on appears on 127.0.0.1)
+    #[command(alias = "ports")]
+    Port { vm: String },
     #[command(name = "__vmm", hide = true)]
     Vmm { name: String },
 }
@@ -108,12 +116,17 @@ fn main() -> ExitCode {
 fn run(cli: Cli) -> Result<i32> {
     let json = cli.json;
     match cli.cmd {
-        Cmd::New { name, cpus, mem } => {
+        Cmd::New {
+            name,
+            cpus,
+            mem,
+            net,
+        } => {
             let name = match name {
                 Some(n) => n,
                 None => unused_random_name(),
             };
-            let mut rec = vm::create(&name, cpus, mem)?;
+            let mut rec = vm::create(&name, cpus, mem, net)?;
             let boot_ms = match vm::start(&mut rec) {
                 Ok(ms) => ms,
                 Err(e) => {
@@ -170,7 +183,10 @@ fn run(cli: Cli) -> Result<i32> {
                     .map(|r| {
                         json!({
                             "name": r.name, "status": state::status(r), "cpus": r.cpus,
-                            "mem_mib": r.mem_mib, "created": r.created,
+                            "mem_mib": r.mem_mib, "created": r.created, "net": r.net,
+                            "ports": ports::read(&r.name).iter()
+                                .map(|m| json!({ "guest": m.guest, "host": m.host }))
+                                .collect::<Vec<_>>(),
                         })
                     })
                     .collect();
@@ -221,6 +237,29 @@ fn run(cli: Cli) -> Result<i32> {
                 print_json(json!({ "name": name, "console": String::from_utf8_lossy(&log) }));
             } else {
                 std::io::stdout().write_all(&log)?;
+            }
+            Ok(0)
+        }
+        Cmd::Port { vm: name } => {
+            let rec = state::load(&name)?;
+            let maps = if state::status(&rec) == Status::Running {
+                ports::read(&name)
+            } else {
+                vec![]
+            };
+            if json {
+                let items: Vec<_> = maps
+                    .iter()
+                    .map(|m| json!({ "guest": m.guest, "host": m.host, "url": m.url() }))
+                    .collect();
+                print_json(json!(items));
+            } else if maps.is_empty() {
+                eprintln!("no ports forwarded; start a server in the VM and it will appear here");
+            } else {
+                println!("{:<7} {:<7} URL", "GUEST", "HOST");
+                for m in &maps {
+                    println!("{:<7} {:<7} {}", m.guest, m.host, m.url());
+                }
             }
             Ok(0)
         }

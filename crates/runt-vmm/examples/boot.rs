@@ -37,6 +37,7 @@ fn main() {
             host_connects: true,
         }],
         console_log: PathBuf::from(&a[2]),
+        net: None,
     };
     let err = runt_vmm::run(&cfg).unwrap_err();
     eprintln!("boot: {err}");

@@ -11,14 +11,15 @@ use std::time::{Duration, Instant};
 
 use crate::client;
 use crate::error::{CliError, Result};
-use crate::state::{self, Status, VmRecord};
+use crate::ports;
+use crate::state::{self, NetMode, Status, VmRecord};
 
 /// Size of the sparse per-VM disk. Only written blocks use host space.
 const UPPER_DISK_BYTES: u64 = 20 * 1024 * 1024 * 1024;
 const BOOT_TIMEOUT: Duration = Duration::from_secs(15);
 const STOP_TIMEOUT: Duration = Duration::from_secs(10);
 
-pub fn create(name: &str, cpus: u8, mem_mib: u32) -> Result<VmRecord> {
+pub fn create(name: &str, cpus: u8, mem_mib: u32, net: NetMode) -> Result<VmRecord> {
     state::validate_name(name)?;
     state::assets()?;
     let dir = state::vm_dir(name);
@@ -38,6 +39,7 @@ pub fn create(name: &str, cpus: u8, mem_mib: u32) -> Result<VmRecord> {
             mem_mib,
             created: state::now_rfc3339(),
             pid: None,
+            net,
         };
         state::save(&rec)?;
         Ok(rec)
@@ -115,6 +117,7 @@ pub fn start(rec: &mut VmRecord) -> Result<u128> {
         .stdin(Stdio::null())
         .stdout(log.try_clone()?)
         .stderr(log);
+    runt_net::prepare_supervisor(&mut cmd);
     // SAFETY: setsid is async-signal-safe; detaches the supervisor from our
     // session so it survives the terminal closing.
     unsafe {
@@ -190,12 +193,27 @@ pub fn supervise(name: &str) -> Result<()> {
     let rec = state::load(name)?;
     let assets = state::assets()?;
     let dir = state::vm_dir(name);
+    let mut cmdline = format!("console=hvc0 quiet panic=-1 runt.name={name}");
+    // Lives as long as this process, which is as long as the VM.
+    let net = match rec.net {
+        NetMode::Nat => {
+            let net = runt_net::start(None).map_err(|e| {
+                CliError::new("net_failed", format!("cannot start networking: {e}"))
+            })?;
+            cmdline.push(' ');
+            cmdline.push_str(&net.guest.cmdline());
+            Some(net)
+        }
+        NetMode::None => None,
+    };
+    ports::start(name)
+        .map_err(|e| CliError::new("ports_failed", format!("cannot start port forwarding: {e}")))?;
     let cfg = runt_vmm::VmConfig {
         vcpus: rec.cpus,
         mem_mib: rec.mem_mib,
         kernel: assets.kernel,
         initramfs: assets.initramfs,
-        cmdline: format!("console=hvc0 quiet panic=-1 runt.name={name}"),
+        cmdline,
         disks: vec![
             runt_vmm::Disk {
                 id: "base".into(),
@@ -219,8 +237,18 @@ pub fn supervise(name: &str) -> Result<()> {
                 socket: state::ready_socket_path(name),
                 host_connects: false,
             },
+            runt_vmm::VsockPort {
+                port: runt_proto::EVENTS_PORT,
+                socket: state::events_socket_path(name),
+                host_connects: false,
+            },
         ],
         console_log: dir.join("console.log"),
+        net: net.as_ref().map(|n| runt_vmm::NetDevice {
+            fd: n.vmm_fd,
+            mac: n.guest.mac,
+            features: 0,
+        }),
     };
     match runt_vmm::run(&cfg) {
         Ok(never) => match never {},
@@ -254,6 +282,8 @@ pub fn stop(rec: &mut VmRecord, force: bool) -> Result<()> {
         }
     }
     state::remove_socket(&sock);
+    state::remove_socket(&state::events_socket_path(&rec.name));
+    ports::clear(&rec.name);
     rec.pid = None;
     state::save(rec)?;
     Ok(())
