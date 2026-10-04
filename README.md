@@ -79,6 +79,24 @@ services on your machine (including ones bound to `127.0.0.1`), your LAN,
 or cloud metadata endpoints. Use `runt new --net none` for a fully offline
 VM.
 
+## Isolation
+
+Your code runs in a real VM with its own kernel, not in a container that
+shares the host's kernel. On top of that, runt confines each VM's host-side
+process, because the virtual devices run there:
+
+- **Landlock** limits it to the VM's own files, the guest kernel and image,
+  `/dev/kvm`, and the folders you shared. It can't read the rest of your
+  home directory or connect to other VMs, your desktop's D-Bus session, or
+  container engine sockets.
+- **seccomp** blocks system calls a VMM never needs: running programs,
+  ptrace, mounting, creating namespaces, loading kernel modules, bpf, and
+  more.
+
+`runt ls --json` shows what was enforced for each VM. On kernels without
+full Landlock support, the VM still runs and `runt new` warns that isolation
+is partial.
+
 ## Building from source
 
 You need Linux with KVM, Rust (via rustup), and a few packages. On Fedora:
