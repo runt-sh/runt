@@ -1,0 +1,11 @@
+[package]
+name = "runt-agent"
+description = "runt guest agent (PID 1 inside runt VMs)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+runt-proto.workspace = true
+libc.workspace = true
