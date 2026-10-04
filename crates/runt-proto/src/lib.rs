@@ -29,6 +29,10 @@ pub const AGENT_PORT: u32 = 1024;
 /// host listens there so boot completion is an event, not a poll.
 pub const READY_PORT: u32 = 1025;
 
+/// Host vsock port runt-agent connects to for pushing events (currently the
+/// set of listening TCP ports, for automatic port forwarding).
+pub const EVENTS_PORT: u32 = 1026;
+
 /// Control stream.
 pub const CTRL: u32 = 0;
 /// Exec stdin (client -> agent).
@@ -79,6 +83,19 @@ pub enum Msg {
     },
     /// Power the VM off.
     Shutdown,
+    /// Open a TCP connection to `port` on the guest's loopback and splice it
+    /// to this connection: host->guest bytes on [`STDIN`], guest->host on
+    /// [`STDOUT`].
+    Connect {
+        port: u16,
+    },
+    /// The `Connect` succeeded; data may flow.
+    Connected,
+    /// The TCP ports listening inside the guest (sent on the events
+    /// connection whenever the set changes).
+    Ports {
+        listening: Vec<u16>,
+    },
     Error {
         message: String,
     },
@@ -289,6 +306,11 @@ mod tests {
                 signal: None,
             },
             Msg::Shutdown,
+            Msg::Connect { port: 3000 },
+            Msg::Connected,
+            Msg::Ports {
+                listening: vec![22, 3000, 8080],
+            },
         ];
         for m in &msgs {
             a.send(m).unwrap();

@@ -11,6 +11,7 @@ use std::time::{Duration, Instant};
 
 use crate::client;
 use crate::error::{CliError, Result};
+use crate::ports;
 use crate::state::{self, NetMode, Status, VmRecord};
 
 /// Size of the sparse per-VM disk. Only written blocks use host space.
@@ -116,13 +117,7 @@ pub fn start(rec: &mut VmRecord) -> Result<u128> {
         .stdin(Stdio::null())
         .stdout(log.try_clone()?)
         .stderr(log);
-    // The network stack reads these to loosen its egress floor; a stray value
-    // in the user's environment must not change a VM's isolation.
-    for (k, _) in std::env::vars_os() {
-        if k.to_string_lossy().starts_with("SMOLVM_") {
-            cmd.env_remove(k);
-        }
-    }
+    runt_net::prepare_supervisor(&mut cmd);
     // SAFETY: setsid is async-signal-safe; detaches the supervisor from our
     // session so it survives the terminal closing.
     unsafe {
@@ -211,6 +206,8 @@ pub fn supervise(name: &str) -> Result<()> {
         }
         NetMode::None => None,
     };
+    ports::start(name)
+        .map_err(|e| CliError::new("ports_failed", format!("cannot start port forwarding: {e}")))?;
     let cfg = runt_vmm::VmConfig {
         vcpus: rec.cpus,
         mem_mib: rec.mem_mib,
@@ -238,6 +235,11 @@ pub fn supervise(name: &str) -> Result<()> {
             runt_vmm::VsockPort {
                 port: runt_proto::READY_PORT,
                 socket: state::ready_socket_path(name),
+                host_connects: false,
+            },
+            runt_vmm::VsockPort {
+                port: runt_proto::EVENTS_PORT,
+                socket: state::events_socket_path(name),
                 host_connects: false,
             },
         ],
@@ -280,6 +282,8 @@ pub fn stop(rec: &mut VmRecord, force: bool) -> Result<()> {
         }
     }
     state::remove_socket(&sock);
+    state::remove_socket(&state::events_socket_path(&rec.name));
+    ports::clear(&rec.name);
     rec.pid = None;
     state::save(rec)?;
     Ok(())

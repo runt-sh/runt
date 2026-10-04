@@ -7,15 +7,17 @@
 //! The stack itself is `smolvm-network`, pinned to an exact version. Nothing
 //! outside this crate names its types, so it can be vendored or replaced.
 //!
-//! Default egress floor (from smolvm-network): the guest cannot reach the
-//! cloud-metadata range (169.254.0.0/16) or the host's own loopback; the
-//! internet and the host's LAN are reachable.
+//! Egress: the guest reaches the public internet only. The host (including
+//! services bound to its loopback, which the gateway address would otherwise
+//! relay to), private LAN ranges, link-local/cloud-metadata and CGNAT are
+//! all blocked. This matches what cloud VMs get. See [`prepare_supervisor`].
 
 use std::fs;
 use std::io;
 use std::net::Ipv4Addr;
 use std::os::fd::{IntoRawFd, RawFd};
 use std::os::unix::net::UnixStream;
+use std::process::Command;
 
 use smolvm_network::{BoundPublishedPorts, EgressPolicy, GuestNetworkConfig, VirtioNetworkRuntime};
 
@@ -47,6 +49,21 @@ pub struct Net {
     pub vmm_fd: RawFd,
     pub guest: GuestAddrs,
     _runtime: VirtioNetworkRuntime,
+}
+
+/// Configure the environment of the process that will call [`start`].
+///
+/// smolvm-network reads its egress floor from the environment once, when the
+/// policy is created. We pin it to `strict` and drop any other `SMOLVM_*`
+/// variables a user might have set, so nothing outside runt can loosen a
+/// VM's isolation.
+pub fn prepare_supervisor(cmd: &mut Command) {
+    for (k, _) in std::env::vars_os() {
+        if k.to_string_lossy().starts_with("SMOLVM_") {
+            cmd.env_remove(k);
+        }
+    }
+    cmd.env("SMOLVM_EGRESS_FLOOR", "strict");
 }
 
 /// Start the userspace network. `upstream_dns` defaults to the host's own

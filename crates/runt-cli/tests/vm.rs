@@ -128,3 +128,94 @@ fn rm_refuses_running_vm_without_force() {
     assert!(o.status.success());
     assert!(runt(&["exec", &vm.0, "--", "true"]).status.code() == Some(125));
 }
+
+/// Run a command in the VM; return (exit code, stdout).
+fn vm_exec(vm: &Vm, cmd: &str) -> (Option<i32>, String) {
+    let o = runt(&["exec", &vm.0, "--", "sh", "-c", cmd]);
+    (o.status.code(), stdout(&o))
+}
+
+#[test]
+#[ignore]
+fn outbound_network() {
+    let vm = Vm::new("net");
+    let (code, _) = vm_exec(&vm, "getent hosts deb.debian.org");
+    assert_eq!(code, Some(0), "DNS lookup failed");
+    let (code, out) = vm_exec(
+        &vm,
+        "curl -fsS -o /dev/null -w '%{http_code}' https://deb.debian.org/",
+    );
+    assert_eq!((code, out.as_str()), (Some(0), "200"));
+    // The gateway must not relay to services on the host's loopback.
+    let host = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = host.local_addr().unwrap().port();
+    let (code, _) = vm_exec(&vm, &format!("curl -s -m 3 http://100.96.0.1:{port}/"));
+    assert_ne!(
+        code,
+        Some(0),
+        "guest reached host loopback through the gateway"
+    );
+    // Cloud metadata is never reachable.
+    let (code, _) = vm_exec(&vm, "curl -s -m 3 http://169.254.169.254/");
+    assert_ne!(code, Some(0));
+}
+
+#[test]
+#[ignore]
+fn offline_vm_has_no_network() {
+    let name = format!("test-offline-{}", std::process::id());
+    let o = runt(&["new", &name, "--net", "none", "--mem", "512M"]);
+    assert!(o.status.success());
+    let vm = Vm(name);
+    let (code, _) = vm_exec(&vm, "getent hosts deb.debian.org");
+    assert_ne!(code, Some(0));
+    let (code, out) = vm_exec(&vm, "ip -br link show eth0 2>&1 || true");
+    assert_eq!(code, Some(0));
+    assert!(out.contains("does not exist") || out.is_empty(), "{out}");
+}
+
+#[test]
+#[ignore]
+fn guest_ports_are_forwarded() {
+    use std::io::Read;
+    use std::time::{Duration, Instant};
+
+    let vm = Vm::new("ports");
+    // A server bound to the guest's loopback only, like most dev servers.
+    let server = r#"perl -MIO::Socket::INET -e '$s=IO::Socket::INET->new(LocalAddr=>"127.0.0.1",LocalPort=>8123,Listen=>5,ReuseAddr=>1) or die; while($c=$s->accept){print $c "hello from the guest\n"; close $c}' >/dev/null 2>&1 &"#;
+    assert_eq!(vm_exec(&vm, server).0, Some(0));
+
+    let host_port = wait_for(Duration::from_secs(5), || {
+        let o = runt(&["port", "--json", &vm.0]);
+        let v: serde_json::Value = serde_json::from_slice(&o.stdout).ok()?;
+        v.as_array()?
+            .iter()
+            .find(|m| m["guest"] == 8123)
+            .and_then(|m| m["host"].as_u64())
+    })
+    .expect("port 8123 was not forwarded");
+
+    let mut s = std::net::TcpStream::connect(("127.0.0.1", host_port as u16)).unwrap();
+    let mut got = String::new();
+    s.read_to_string(&mut got).unwrap();
+    assert_eq!(got, "hello from the guest\n");
+
+    // Stopping the server removes the forward.
+    vm_exec(&vm, "pkill -f IO::Socket::INET");
+    let gone = wait_for(Duration::from_secs(5), || {
+        let o = runt(&["port", "--json", &vm.0]);
+        (stdout(&o).trim() == "[]").then_some(())
+    });
+    assert!(gone.is_some(), "forward was not removed");
+
+    fn wait_for<T>(timeout: Duration, mut f: impl FnMut() -> Option<T>) -> Option<T> {
+        let t = Instant::now();
+        while t.elapsed() < timeout {
+            if let Some(v) = f() {
+                return Some(v);
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        None
+    }
+}

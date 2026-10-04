@@ -93,6 +93,16 @@ pub fn ready_socket_path(name: &str) -> PathBuf {
     runtime_dir().join(format!("{name}.ready"))
 }
 
+/// Socket the supervisor listens on for the agent's events (listening ports).
+pub fn events_socket_path(name: &str) -> PathBuf {
+    runtime_dir().join(format!("{name}.events"))
+}
+
+/// Current port forwards, written by the supervisor.
+pub fn ports_path(name: &str) -> PathBuf {
+    runtime_dir().join(format!("{name}.ports.json"))
+}
+
 fn runtime_dir() -> PathBuf {
     match std::env::var_os("XDG_RUNTIME_DIR") {
         Some(v) if !v.is_empty() => PathBuf::from(v).join("runt"),

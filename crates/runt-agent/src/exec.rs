@@ -31,6 +31,7 @@ pub fn serve(conn: File) {
             return;
         }
     };
+    let raw = conn.as_raw_fd();
     let (mux, rx) = Mux::new(reader, conn);
     let hello = Msg::Hello {
         version: runt_proto::VERSION,
@@ -48,8 +49,19 @@ pub fn serve(conn: File) {
             }
         }
         Ok(Event::Msg(Msg::Shutdown)) => crate::shutdown(),
+        Ok(Event::Msg(Msg::Connect { port })) => {
+            if let Err(e) = crate::ports::splice(&mux, &rx, port) {
+                let _ = mux.send(&Msg::Error {
+                    message: e.to_string(),
+                });
+            }
+        }
         _ => {}
     }
+    // Make sure the host sees the end of the session even while our reader
+    // thread still holds a duplicate of the socket.
+    // SAFETY: shutdown(2) on a socket we still own.
+    unsafe { libc::shutdown(raw, libc::SHUT_RDWR) };
 }
 
 fn exec(mux: &Mux, rx: &Receiver<Event>, req: ExecRequest) -> io::Result<()> {
