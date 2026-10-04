@@ -44,6 +44,9 @@ enum Cmd {
         /// Memory, e.g. 512M or 2G
         #[arg(long, default_value = "1G", value_parser = parse_mem)]
         mem: u32,
+        /// Networking: nat (outbound internet) or none (fully offline)
+        #[arg(long, value_enum, default_value_t = state::NetMode::Nat)]
+        net: state::NetMode,
     },
     /// Run a command in a VM
     #[command(trailing_var_arg = true)]
@@ -108,12 +111,17 @@ fn main() -> ExitCode {
 fn run(cli: Cli) -> Result<i32> {
     let json = cli.json;
     match cli.cmd {
-        Cmd::New { name, cpus, mem } => {
+        Cmd::New {
+            name,
+            cpus,
+            mem,
+            net,
+        } => {
             let name = match name {
                 Some(n) => n,
                 None => unused_random_name(),
             };
-            let mut rec = vm::create(&name, cpus, mem)?;
+            let mut rec = vm::create(&name, cpus, mem, net)?;
             let boot_ms = match vm::start(&mut rec) {
                 Ok(ms) => ms,
                 Err(e) => {

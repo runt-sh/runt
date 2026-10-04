@@ -13,6 +13,7 @@ path = "src/main.rs"
 [dependencies]
 runt-proto.workspace = true
 runt-vmm.workspace = true
+runt-net.workspace = true
 libc.workspace = true
 serde.workspace = true
 serde_json.workspace = true

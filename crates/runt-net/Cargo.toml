@@ -1,0 +1,12 @@
+[package]
+name = "runt-net"
+description = "Userspace networking for runt VMs"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+# Pinned exactly: fast-moving upstream; everything smolvm-specific stays in this crate.
+smolvm-network = "=1.22.2"
+socket2 = "0.6"

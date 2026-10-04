@@ -5,6 +5,7 @@
 
 mod boot;
 mod exec;
+mod net;
 mod sys;
 
 use std::thread;

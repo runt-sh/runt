@@ -26,6 +26,19 @@ pub struct VmRecord {
     pub created: String,
     #[serde(default)]
     pub pid: Option<u32>,
+    #[serde(default)]
+    pub net: NetMode,
+}
+
+/// How a VM is connected to the outside world.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, clap::ValueEnum)]
+#[serde(rename_all = "lowercase")]
+pub enum NetMode {
+    /// Outbound NAT through runt's userspace network stack
+    #[default]
+    Nat,
+    /// No network device at all
+    None,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
