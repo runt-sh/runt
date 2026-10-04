@@ -475,3 +475,88 @@ fn egress_rejects_bad_rules() {
         assert_eq!(err["error"]["code"], "invalid_egress", "{args:?}");
     }
 }
+
+#[test]
+#[ignore]
+fn mcp_server() {
+    use std::io::{BufRead, BufReader, Write};
+    use std::process::Stdio;
+
+    let dir = std::env::temp_dir().join(format!("runt-test-mcp-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("hello.txt"), "from the host\n").unwrap();
+    let mut child = Command::new(env!("CARGO_BIN_EXE_runt"))
+        .arg("mcp")
+        .current_dir(&dir)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut stdin = child.stdin.take().unwrap();
+    let mut stdout = BufReader::new(child.stdout.take().unwrap());
+    let mut id = 0;
+    let mut rpc = |method: &str, params: serde_json::Value| {
+        id += 1;
+        let req =
+            serde_json::json!({ "jsonrpc": "2.0", "id": id, "method": method, "params": params });
+        writeln!(stdin, "{req}").unwrap();
+        let mut line = String::new();
+        stdout.read_line(&mut line).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(v["id"], id);
+        v["result"].clone()
+    };
+    let call = |rpc: &mut dyn FnMut(&str, serde_json::Value) -> serde_json::Value,
+                tool: &str,
+                args: serde_json::Value| {
+        rpc(
+            "tools/call",
+            serde_json::json!({ "name": tool, "arguments": args }),
+        )
+    };
+
+    let init = rpc(
+        "initialize",
+        serde_json::json!({ "protocolVersion": "2025-06-18" }),
+    );
+    assert_eq!(init["protocolVersion"], "2025-06-18");
+    let name = format!("test-mcp-{}", std::process::id());
+    let r = call(
+        &mut rpc,
+        "vm_create",
+        serde_json::json!({ "name": name, "mounts": ["."] }),
+    );
+    assert_ne!(r["isError"], true, "{r}");
+    let vm = Vm(name.clone());
+
+    // Runs in the shared directory by default, with stdin.
+    let r = call(
+        &mut rpc,
+        "vm_exec",
+        serde_json::json!({ "vm": name, "command": "cat hello.txt; cat; exit 4", "stdin": "piped\n" }),
+    );
+    assert_eq!(r["structuredContent"]["exit_code"], 4);
+    assert_eq!(r["structuredContent"]["stdout"], "from the host\npiped\n");
+
+    let r = call(
+        &mut rpc,
+        "vm_exec",
+        serde_json::json!({ "vm": name, "command": "sleep 60", "timeout": 1 }),
+    );
+    assert_eq!(r["structuredContent"]["timed_out"], true);
+
+    // Shares outside the server's directory are refused.
+    let r = call(
+        &mut rpc,
+        "vm_create",
+        serde_json::json!({ "name": "never-created", "mounts": ["/tmp"] }),
+    );
+    assert_eq!(r["isError"], true);
+
+    let r = call(&mut rpc, "vm_remove", serde_json::json!({ "vm": name }));
+    assert_ne!(r["isError"], true);
+    std::mem::forget(vm);
+    drop(stdin);
+    assert!(child.wait().unwrap().success());
+    std::fs::remove_dir_all(&dir).unwrap();
+}
