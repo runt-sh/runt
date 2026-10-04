@@ -23,7 +23,7 @@ initramfs: agent
 	images/initramfs/build.sh $(AGENT_BIN) $(CACHE)/initramfs.cpio
 
 image:
-	images/base/build.sh docker.io/library/debian:trixie-slim $(CACHE)/images/base.erofs
+	images/base/build.sh images/base $(CACHE)/images/base.erofs
 
 assets: kernel initramfs image
 
