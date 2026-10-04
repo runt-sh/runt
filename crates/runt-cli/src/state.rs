@@ -28,6 +28,8 @@ pub struct VmRecord {
     pub pid: Option<u32>,
     #[serde(default)]
     pub net: NetMode,
+    #[serde(default)]
+    pub mounts: Vec<crate::mounts::Mount>,
 }
 
 /// How a VM is connected to the outside world.

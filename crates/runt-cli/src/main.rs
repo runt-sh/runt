@@ -2,6 +2,7 @@
 
 mod client;
 mod error;
+mod mounts;
 mod names;
 mod ports;
 mod state;
@@ -48,6 +49,10 @@ enum Cmd {
         /// Networking: nat (outbound internet) or none (fully offline)
         #[arg(long, value_enum, default_value_t = state::NetMode::Nat)]
         net: state::NetMode,
+        /// Share a host directory: SRC[:DST][:ro]. DST defaults to the same
+        /// path as on the host. Repeatable.
+        #[arg(short = 'm', long = "mount", value_name = "SRC[:DST][:ro]")]
+        mounts: Vec<String>,
     },
     /// Run a command in a VM
     #[command(trailing_var_arg = true)]
@@ -121,12 +126,23 @@ fn run(cli: Cli) -> Result<i32> {
             cpus,
             mem,
             net,
+            mounts,
         } => {
             let name = match name {
                 Some(n) => n,
                 None => unused_random_name(),
             };
-            let mut rec = vm::create(&name, cpus, mem, net)?;
+            let cwd = std::env::current_dir()?;
+            let mounts = mounts
+                .iter()
+                .map(|m| mounts::parse(m, &cwd))
+                .collect::<Result<Vec<_>>>()?;
+            if let Some(home) = std::env::var_os("HOME")
+                && mounts.iter().any(|m| m.src == std::path::Path::new(&home))
+            {
+                eprintln!("runt: warning: sharing your entire home directory with the VM");
+            }
+            let mut rec = vm::create(&name, cpus, mem, net, mounts)?;
             let boot_ms = match vm::start(&mut rec) {
                 Ok(ms) => ms,
                 Err(e) => {
@@ -137,10 +153,14 @@ fn run(cli: Cli) -> Result<i32> {
             if json {
                 print_json(json!({
                     "name": rec.name, "status": "running", "cpus": rec.cpus,
-                    "mem_mib": rec.mem_mib, "boot_ms": boot_ms,
+                    "mem_mib": rec.mem_mib, "boot_ms": boot_ms, "mounts": rec.mounts,
                 }));
             } else {
                 println!("{}", rec.name);
+                for m in &rec.mounts {
+                    let ro = if m.read_only { " (read-only)" } else { "" };
+                    eprintln!("mounted {} at {}{ro}", m.src.display(), m.dst.display());
+                }
                 eprintln!("booted in {boot_ms} ms; try `runt shell {}`", rec.name);
             }
             Ok(0)
@@ -184,6 +204,7 @@ fn run(cli: Cli) -> Result<i32> {
                         json!({
                             "name": r.name, "status": state::status(r), "cpus": r.cpus,
                             "mem_mib": r.mem_mib, "created": r.created, "net": r.net,
+                            "mounts": r.mounts,
                             "ports": ports::read(&r.name).iter()
                                 .map(|m| json!({ "guest": m.guest, "host": m.host }))
                                 .collect::<Vec<_>>(),
@@ -282,6 +303,10 @@ fn exec(
                 .hint(format!("start it with `runt start {name}`")),
         );
     }
+    let cwd = cwd.or_else(|| {
+        let here = std::env::current_dir().ok()?;
+        mounts::default_workdir(&here, &rec.mounts).map(|p| p.to_string_lossy().into_owned())
+    });
     let conn = client::connect(name, &state::socket_path(name))?;
     let mut env = env;
     if tty && let Ok(t) = std::env::var("TERM") {

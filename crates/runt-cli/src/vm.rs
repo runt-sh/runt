@@ -11,6 +11,7 @@ use std::time::{Duration, Instant};
 
 use crate::client;
 use crate::error::{CliError, Result};
+use crate::mounts::{self, Mount};
 use crate::ports;
 use crate::state::{self, NetMode, Status, VmRecord};
 
@@ -19,8 +20,18 @@ const UPPER_DISK_BYTES: u64 = 20 * 1024 * 1024 * 1024;
 const BOOT_TIMEOUT: Duration = Duration::from_secs(15);
 const STOP_TIMEOUT: Duration = Duration::from_secs(10);
 
-pub fn create(name: &str, cpus: u8, mem_mib: u32, net: NetMode) -> Result<VmRecord> {
+pub fn create(
+    name: &str,
+    cpus: u8,
+    mem_mib: u32,
+    net: NetMode,
+    mounts: Vec<Mount>,
+) -> Result<VmRecord> {
     state::validate_name(name)?;
+    mounts::validate_set(&mounts)?;
+    if let Some(fs) = mounts::cmdline(&mounts) {
+        mounts::check_cmdline_len(&fs)?;
+    }
     state::assets()?;
     let dir = state::vm_dir(name);
     if dir.exists() {
@@ -40,6 +51,7 @@ pub fn create(name: &str, cpus: u8, mem_mib: u32, net: NetMode) -> Result<VmReco
             created: state::now_rfc3339(),
             pid: None,
             net,
+            mounts,
         };
         state::save(&rec)?;
         Ok(rec)
@@ -206,6 +218,11 @@ pub fn supervise(name: &str) -> Result<()> {
         }
         NetMode::None => None,
     };
+    if let Some(fs) = mounts::cmdline(&rec.mounts) {
+        cmdline.push(' ');
+        cmdline.push_str(&fs);
+    }
+    mounts::check_cmdline_len(&cmdline)?;
     ports::start(name)
         .map_err(|e| CliError::new("ports_failed", format!("cannot start port forwarding: {e}")))?;
     let cfg = runt_vmm::VmConfig {
@@ -244,6 +261,16 @@ pub fn supervise(name: &str) -> Result<()> {
             },
         ],
         console_log: dir.join("console.log"),
+        shares: rec
+            .mounts
+            .iter()
+            .enumerate()
+            .map(|(i, m)| runt_vmm::Share {
+                tag: mounts::tag(i),
+                path: m.src.clone(),
+                read_only: m.read_only,
+            })
+            .collect(),
         net: net.as_ref().map(|n| runt_vmm::NetDevice {
             fd: n.vmm_fd,
             mac: n.guest.mac,
