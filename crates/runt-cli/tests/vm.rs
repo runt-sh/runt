@@ -19,8 +19,14 @@ struct Vm(String);
 
 impl Vm {
     fn new(tag: &str) -> Vm {
+        Vm::with(tag, &[])
+    }
+
+    fn with(tag: &str, extra: &[&str]) -> Vm {
         let name = format!("test-{tag}-{}", std::process::id());
-        let o = runt(&["new", &name, "--json", "--mem", "512M"]);
+        let mut args = vec!["new", &name, "--json", "--mem", "512M"];
+        args.extend_from_slice(extra);
+        let o = runt(&args);
         assert!(
             o.status.success(),
             "runt new failed: {}",
@@ -358,4 +364,114 @@ fn vm_process_is_sandboxed() {
 
     drop((a, b));
     let _ = std::fs::remove_dir_all(&base);
+}
+
+/// This machine's address on its LAN, if it has a private one.
+fn host_lan_ip() -> Option<std::net::Ipv4Addr> {
+    let s = std::net::UdpSocket::bind("0.0.0.0:0").ok()?;
+    s.connect("1.1.1.1:53").ok()?;
+    match s.local_addr().ok()?.ip() {
+        std::net::IpAddr::V4(ip) if ip.is_private() => Some(ip),
+        _ => None,
+    }
+}
+
+fn http_code(vm: &Vm, url: &str) -> String {
+    vm_exec(
+        vm,
+        &format!("curl -s -o /dev/null -m 5 -w '%{{http_code}}' {url}"),
+    )
+    .1
+}
+
+#[test]
+#[ignore]
+fn egress_allowlist() {
+    let vm = Vm::with(
+        "allow",
+        &["--allow", "deb.debian.org", "--allow", "1.1.1.1"],
+    );
+    assert_eq!(http_code(&vm, "https://deb.debian.org/"), "200");
+    // Not listed: DNS refuses, and direct connections are dropped.
+    let (code, _) = vm_exec(&vm, "getent hosts example.com");
+    assert_ne!(code, Some(0), "unlisted domain resolved");
+    assert_eq!(http_code(&vm, "http://8.8.8.8/"), "000");
+    // Exact names don't cover subdomains.
+    let (code, _) = vm_exec(&vm, "getent hosts security.debian.org");
+    assert_ne!(code, Some(0));
+    // A listed address works without DNS.
+    assert_ne!(http_code(&vm, "http://1.1.1.1/"), "000");
+    // Refusals are logged for `runt logs --egress`.
+    let o = runt(&["logs", &vm.0, "--egress", "--json"]);
+    let v: serde_json::Value = serde_json::from_slice(&o.stdout).unwrap();
+    let denied = v["denied"].as_array().unwrap();
+    assert!(
+        denied
+            .iter()
+            .any(|d| d["op"] == "resolve" && d["dest"] == "example.com")
+    );
+    assert!(
+        denied
+            .iter()
+            .any(|d| d["op"] == "connect" && d["dest"] == "8.8.8.8:80")
+    );
+}
+
+#[test]
+#[ignore]
+fn egress_lan_never_reaches_host_loopback() {
+    let lan_server = std::net::TcpListener::bind("0.0.0.0:0").unwrap();
+    let lan_port = lan_server.local_addr().unwrap().port();
+    let lo_server = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let lo_port = lo_server.local_addr().unwrap().port();
+    let accept = |l: std::net::TcpListener| {
+        std::thread::spawn(move || {
+            for c in l.incoming().flatten() {
+                use std::io::Write;
+                let _ = (&c).write_all(b"HTTP/1.0 204 No Content\r\n\r\n");
+            }
+        })
+    };
+    accept(lan_server);
+    accept(lo_server);
+
+    let lan = Vm::with("lan", &["--allow-lan"]);
+    let default = Vm::new("nolan");
+    if let Some(ip) = host_lan_ip() {
+        let url = format!("http://{ip}:{lan_port}/");
+        assert_eq!(
+            http_code(&lan, &url),
+            "204",
+            "--allow-lan VM can't reach the LAN"
+        );
+        assert_eq!(
+            http_code(&default, &url),
+            "000",
+            "default VM reached the LAN"
+        );
+    }
+    for vm in [&lan, &default] {
+        assert_eq!(http_code(vm, "https://deb.debian.org/"), "200");
+        let gw = format!("http://100.96.0.1:{lo_port}/");
+        assert_eq!(http_code(vm, &gw), "000", "{} reached host loopback", vm.0);
+        assert_eq!(http_code(vm, "http://169.254.169.254/"), "000");
+    }
+}
+
+#[test]
+fn egress_rejects_bad_rules() {
+    for args in [
+        &["--allow", "github.com", "--allow-lan"][..],
+        &["--allow", "127.0.0.1"],
+        &["--allow", "not a domain"],
+        &["--allow", "fd00::/8"],
+        &["--net", "none", "--allow-lan"],
+    ] {
+        let mut a = vec!["new", "never-created", "--json"];
+        a.extend_from_slice(args);
+        let o = runt(&a);
+        assert_eq!(o.status.code(), Some(125), "{args:?} should be refused");
+        let err: serde_json::Value = serde_json::from_slice(&o.stderr).unwrap();
+        assert_eq!(err["error"]["code"], "invalid_egress", "{args:?}");
+    }
 }

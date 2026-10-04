@@ -7,19 +7,25 @@
 //! The stack itself is `smolvm-network`, pinned to an exact version. Nothing
 //! outside this crate names its types, so it can be vendored or replaced.
 //!
-//! Egress: the guest reaches the public internet only. The host (including
-//! services bound to its loopback, which the gateway address would otherwise
-//! relay to), private LAN ranges, link-local/cloud-metadata and CGNAT are
-//! all blocked. This matches what cloud VMs get. See [`prepare_supervisor`].
+//! Egress: by default the guest reaches the public internet only. The host
+//! (including services bound to its loopback, which the gateway address would
+//! otherwise relay to), private LAN ranges, link-local/cloud-metadata and
+//! CGNAT are all blocked. This matches what cloud VMs get. [`egress`] narrows
+//! or widens that per VM.
 
 use std::fs;
 use std::io;
 use std::net::Ipv4Addr;
 use std::os::fd::{IntoRawFd, RawFd};
 use std::os::unix::net::UnixStream;
+use std::path::PathBuf;
 use std::process::Command;
 
-use smolvm_network::{BoundPublishedPorts, EgressPolicy, GuestNetworkConfig, VirtioNetworkRuntime};
+pub mod egress;
+
+pub use egress::{Policy, Rule, parse_rule};
+
+use smolvm_network::{BoundPublishedPorts, GuestNetworkConfig, VirtioNetworkRuntime};
 
 /// Addresses the guest is configured with (statically, via the kernel
 /// command line; there is no DHCP).
@@ -54,21 +60,46 @@ pub struct Net {
 /// Configure the environment of the process that will call [`start`].
 ///
 /// smolvm-network reads its egress floor from the environment once, when the
-/// policy is created. We pin it to `strict` and drop any other `SMOLVM_*`
-/// variables a user might have set, so nothing outside runt can loosen a
-/// VM's isolation.
-pub fn prepare_supervisor(cmd: &mut Command) {
+/// policy is created. We drop any `SMOLVM_*` variables a user might have set,
+/// so nothing outside runt can loosen a VM's isolation, and pin the floor to
+/// `strict` unless the policy reaches private networks (see [`egress`]).
+pub fn prepare_supervisor(cmd: &mut Command, policy: &Policy) {
     for (k, _) in std::env::vars_os() {
         if k.to_string_lossy().starts_with("SMOLVM_") {
             cmd.env_remove(k);
         }
     }
-    cmd.env("SMOLVM_EGRESS_FLOOR", "strict");
+    if policy.strict() {
+        cmd.env(FLOOR_VAR, "strict");
+    }
+}
+
+const FLOOR_VAR: &str = "SMOLVM_EGRESS_FLOOR";
+
+/// Fail closed unless the environment holds exactly what
+/// [`prepare_supervisor`] set for this policy.
+fn check_environment(policy: &Policy) -> io::Result<()> {
+    let floor = std::env::var(FLOOR_VAR).ok();
+    let others = std::env::vars_os()
+        .any(|(k, _)| k.to_string_lossy().starts_with("SMOLVM_") && k != FLOOR_VAR);
+    let expected = policy.strict().then_some("strict");
+    if others || floor.as_deref() != expected {
+        return Err(io::Error::other(
+            "network environment does not match the VM's egress policy",
+        ));
+    }
+    Ok(())
 }
 
 /// Start the userspace network. `upstream_dns` defaults to the host's own
-/// resolver so VPN and split-horizon DNS keep working inside the VM.
-pub fn start(upstream_dns: Option<Ipv4Addr>) -> io::Result<Net> {
+/// resolver so VPN and split-horizon DNS keep working inside the VM. Refused
+/// connections are logged to `denial_log`.
+pub fn start(
+    upstream_dns: Option<Ipv4Addr>,
+    policy: &Policy,
+    denial_log: Option<PathBuf>,
+) -> io::Result<Net> {
+    check_environment(policy)?;
     let mut cfg = GuestNetworkConfig::default();
     cfg.upstream_dns = upstream_dns
         .or_else(host_resolver)
@@ -80,12 +111,17 @@ pub fn start(upstream_dns: Option<Ipv4Addr>) -> io::Result<Net> {
         dns: cfg.dns_server,
         mac: cfg.guest_mac,
     };
+    let (cidrs, hosts) = policy.smolvm_lists(egress::Net::new(cfg.guest_ip, cfg.prefix_len));
+    let mut egress = smolvm_network::EgressPolicy::new(cidrs.as_deref(), hosts.as_deref());
+    if let Some(path) = denial_log {
+        egress = egress.with_denial_log(path);
+    }
     let (vmm_end, stack_end) = UnixStream::pair()?;
     let runtime = smolvm_network::start_virtio_network(
         socket2::Socket::from(std::os::fd::OwnedFd::from(stack_end)),
         cfg,
         BoundPublishedPorts::bind(&[])?,
-        EgressPolicy::unrestricted(),
+        egress,
         None,
     )?;
     Ok(Net {

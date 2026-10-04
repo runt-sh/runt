@@ -6,6 +6,7 @@
 //!                                 upper.ext4   per-VM writable disk
 //!                                 console.log  guest console
 //!                                 vmm.log      supervisor stderr
+//!                                 egress.log   connections the policy refused
 //! $XDG_RUNTIME_DIR/runt/<name>/agent.sock       agent socket (libkrun listens)
 //!                              ready.sock, events.sock, ports.json, sandbox.json
 //! $XDG_CACHE_HOME/runt/{vmlinux,initramfs.cpio,images/base.erofs}
@@ -31,6 +32,60 @@ pub struct VmRecord {
     pub net: NetMode,
     #[serde(default)]
     pub mounts: Vec<crate::mounts::Mount>,
+    #[serde(default)]
+    pub egress: Egress,
+}
+
+/// What a NAT VM's network may reach beyond the default (public internet).
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct Egress {
+    /// `--allow` rules, canonicalized: domains and IPv4 networks. Non-empty
+    /// means only these are reachable.
+    #[serde(default)]
+    pub allow: Vec<String>,
+    /// `--allow-lan`: private networks around the host are reachable too.
+    #[serde(default)]
+    pub lan: bool,
+}
+
+impl Egress {
+    /// Parse and canonicalize `--allow` values.
+    pub fn new(allow: &[String], lan: bool) -> Result<Egress> {
+        let mut canon = Vec::new();
+        for a in allow {
+            let rule = runt_net::parse_rule(a).map_err(invalid_egress)?;
+            let s = match rule {
+                runt_net::Rule::Domain(d) => d,
+                runt_net::Rule::Net(n) if n.len == 32 => n.addr.to_string(),
+                runt_net::Rule::Net(n) => n.to_string(),
+            };
+            if !canon.contains(&s) {
+                canon.push(s);
+            }
+        }
+        let e = Egress { allow: canon, lan };
+        e.policy()?;
+        Ok(e)
+    }
+
+    pub fn policy(&self) -> Result<runt_net::Policy> {
+        let rules = self
+            .allow
+            .iter()
+            .map(|a| runt_net::parse_rule(a))
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(invalid_egress)?;
+        runt_net::Policy::new(&rules, self.lan).map_err(invalid_egress)
+    }
+
+    pub fn is_default(&self) -> bool {
+        self.allow.is_empty() && !self.lan
+    }
+}
+
+fn invalid_egress(msg: String) -> CliError {
+    CliError::new("invalid_egress", msg)
+        .hint("use --allow DOMAIN, --allow '*.DOMAIN' or --allow IPV4[/LEN], and/or --allow-lan")
 }
 
 /// How a VM is connected to the outside world.
@@ -71,6 +126,10 @@ fn xdg(var: &str, fallback: &str) -> PathBuf {
         Some(v) if !v.is_empty() => PathBuf::from(v),
         _ => home().join(fallback),
     }
+}
+
+pub fn egress_log_path(name: &str) -> PathBuf {
+    vm_dir(name).join("egress.log")
 }
 
 pub fn vms_dir() -> PathBuf {

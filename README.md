@@ -74,10 +74,35 @@ port on your machine's `127.0.0.1` (or a free port if that one is taken).
 This works even for servers that bind only to the VM's localhost. Run
 `runt port VM` to see the mappings.
 
-For safety, a VM can reach **only the public internet**. It can't reach
-services on your machine (including ones bound to `127.0.0.1`), your LAN,
-or cloud metadata endpoints. Use `runt new --net none` for a fully offline
-VM.
+For safety, a VM can reach **only the public internet** by default. It can't
+reach services on your machine (including ones bound to `127.0.0.1`), your
+LAN, or cloud metadata endpoints. You can narrow or widen that when you
+create the VM:
+
+```sh
+# Only these destinations; everything else is refused
+runt new --allow github.com --allow '*.githubusercontent.com' --allow 203.0.113.7
+
+# The internet plus private networks around you (LAN, Tailscale)
+runt new --allow-lan
+
+# Fully offline
+runt new --net none
+```
+
+- `example.com` matches exactly that name and `*.example.com` matches any
+  subdomain. Unlisted names don't resolve, and connections to unlisted
+  addresses are dropped.
+- Domains are enforced through DNS: the VM may connect to the addresses an
+  allowed name resolves to. Sites sharing a CDN address can share access.
+- `--allow-lan` and private addresses (`--allow 192.168.1.20`) can't be
+  combined with domain rules yet.
+- Your machine's own loopback services are never reachable, even with
+  `--allow-lan`. Services listening on its LAN address are, with
+  `--allow-lan`.
+
+`runt logs VM --egress` lists what was refused, which helps when building an
+allowlist.
 
 ## Isolation
 

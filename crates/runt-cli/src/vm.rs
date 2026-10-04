@@ -14,7 +14,7 @@ use crate::client;
 use crate::error::{CliError, Result};
 use crate::mounts::{self, Mount};
 use crate::ports;
-use crate::state::{self, NetMode, Status, VmRecord};
+use crate::state::{self, Egress, NetMode, Status, VmRecord};
 
 /// Size of the sparse per-VM disk. Only written blocks use host space.
 const UPPER_DISK_BYTES: u64 = 20 * 1024 * 1024 * 1024;
@@ -26,9 +26,16 @@ pub fn create(
     cpus: u8,
     mem_mib: u32,
     net: NetMode,
+    egress: Egress,
     mounts: Vec<Mount>,
 ) -> Result<VmRecord> {
     state::validate_name(name)?;
+    if net == NetMode::None && !egress.is_default() {
+        return Err(
+            CliError::new("invalid_egress", "--allow and --allow-lan need networking")
+                .hint("drop --net none, or drop the --allow options"),
+        );
+    }
     mounts::validate_set(&mounts)?;
     if let Some(fs) = mounts::cmdline(&mounts) {
         mounts::check_cmdline_len(&fs)?;
@@ -53,6 +60,7 @@ pub fn create(
             pid: None,
             net,
             mounts,
+            egress,
         };
         state::save(&rec)?;
         Ok(rec)
@@ -133,7 +141,7 @@ pub fn start(rec: &mut VmRecord) -> Result<u128> {
         .stdin(Stdio::null())
         .stdout(log.try_clone()?)
         .stderr(log);
-    runt_net::prepare_supervisor(&mut cmd);
+    runt_net::prepare_supervisor(&mut cmd, &rec.egress.policy()?);
     // SAFETY: setsid is async-signal-safe; detaches the supervisor from our
     // session so it survives the terminal closing.
     unsafe {
@@ -220,7 +228,9 @@ pub fn supervise(name: &str) -> Result<()> {
     // Lives as long as this process, which is as long as the VM.
     let net = match rec.net {
         NetMode::Nat => {
-            let net = runt_net::start(dns).map_err(|e| {
+            let policy = rec.egress.policy()?;
+            let log = state::egress_log_path(name);
+            let net = runt_net::start(dns, &policy, Some(log)).map_err(|e| {
                 CliError::new("net_failed", format!("cannot start networking: {e}"))
             })?;
             cmdline.push(' ');
