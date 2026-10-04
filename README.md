@@ -17,14 +17,13 @@ $ runt exec --json nimble-shrew -- sh -c 'echo hi; exit 3'
 ```
 
 > **Status: early development.** Linux (x86_64, KVM) only for now. macOS and
-> Windows support, shared folders and `runt deploy` to [runt.sh](https://runt.sh)
-> are on the way.
+> Windows support and `runt deploy` to [runt.sh](https://runt.sh) are on the way.
 
 ## Commands
 
 | Command | What it does |
 | --- | --- |
-| `runt new [NAME] [--cpus N] [--mem 1G]` | Create and boot a VM |
+| `runt new [NAME] [--cpus N] [--mem 1G] [--mount SRC[:DST][:ro]]` | Create and boot a VM |
 | `runt exec VM [-t] [-e K=V] [-w DIR] -- CMD...` | Run a command; exits with its exit code |
 | `runt shell VM` | Interactive shell |
 | `runt ls` | List VMs |
@@ -36,6 +35,33 @@ $ runt exec --json nimble-shrew -- sh -c 'echo hi; exit 3'
 Add `--json` to any command for machine-readable output. runt's own errors
 exit with 125 and, in JSON mode, print `{"error": {"code", "message", "hint"}}`
 to stderr.
+
+## Shared folders
+
+```console
+$ cd ~/src/myapp
+$ runt new dev --mount .
+$ runt exec dev -- npm test        # runs in ~/src/myapp inside the VM
+```
+
+`--mount SRC[:DST][:ro]` shares a host directory with the VM, and you can
+repeat it. Without a DST, the folder appears at the **same path** inside the
+VM as on your machine, so paths in logs and errors match on both sides.
+`runt exec` and `runt shell` start in your current directory when it's inside
+a mount. Add `:ro` to make a share read-only; this is enforced outside the
+guest, so the VM can't remount it writable.
+
+- **Ownership:** files the VM creates in a share are owned by you on the host.
+- **Hot reload:** changes you make on the host don't trigger file-watch
+  (inotify) events inside the VM. If a dev server running in the VM needs to
+  pick up edits made on the host, turn on polling, for example
+  `CHOKIDAR_USEPOLLING=1`, `WATCHPACK_POLLING=true`, or Vite's
+  `server.watch.usePolling`.
+- **Speed:** heavy metadata work (huge `node_modules` trees) is faster on the
+  VM's own disk than on a share.
+- **Trust:** treat files the VM writes into a share as untrusted, just as you
+  would files from any sandboxed program. For example, symlinks it creates
+  are followed by programs on your machine.
 
 ## Networking
 

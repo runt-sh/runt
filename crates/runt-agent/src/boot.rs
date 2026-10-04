@@ -11,6 +11,7 @@ use std::io;
 use std::os::unix::fs::DirBuilderExt;
 use std::path::Path;
 
+use crate::mounts::GuestMount;
 use crate::net::NetConfig;
 use crate::sys::{self, cvt};
 
@@ -24,6 +25,8 @@ pub struct Cmdline {
     pub name: Option<String>,
     /// Static network config; None means the VM has no network.
     pub net: Option<NetConfig>,
+    /// Shared folders to mount.
+    pub mounts: Vec<GuestMount>,
 }
 
 impl Cmdline {
@@ -32,6 +35,15 @@ impl Cmdline {
         Cmdline {
             name: get("runt.name=").map(String::from),
             net: NetConfig::parse(get("runt.ip="), get("runt.gw="), get("runt.dns=")),
+            mounts: get("runt.fs=")
+                .map(|v| {
+                    let (mounts, errors) = crate::mounts::parse(v);
+                    for e in errors {
+                        eprintln!("runt-agent: warning: {e}");
+                    }
+                    mounts
+                })
+                .unwrap_or_default(),
         }
     }
 }
@@ -86,6 +98,7 @@ pub fn early() -> io::Result<Cmdline> {
     std::env::set_current_dir("/")?;
 
     late_mounts()?;
+    crate::mounts::mount_all(&cmdline.mounts);
     if let Some(name) = &cmdline.name {
         // SAFETY: pointer/len describe a valid buffer.
         cvt(unsafe { libc::sethostname(name.as_ptr().cast(), name.len()) })?;
@@ -147,14 +160,14 @@ fn late_mounts() -> io::Result<()> {
     Ok(())
 }
 
-fn mkdir_p(p: &str) -> io::Result<()> {
+pub fn mkdir_p(p: &str) -> io::Result<()> {
     fs::DirBuilder::new()
         .recursive(true)
         .mode(0o755)
         .create(Path::new(p))
 }
 
-fn mount(
+pub fn mount(
     src: &str,
     target: &str,
     fstype: &str,

@@ -30,6 +30,17 @@ pub struct VmConfig {
     pub console_log: PathBuf,
     /// virtio-net device (eth0), if the VM has networking.
     pub net: Option<NetDevice>,
+    /// Host directories shared into the guest with virtio-fs.
+    pub shares: Vec<Share>,
+}
+
+/// A host directory exposed to the guest as a virtio-fs filesystem.
+#[derive(Debug, Clone)]
+pub struct Share {
+    /// Tag the guest mounts it by (`mount -t virtiofs <tag> <dir>`).
+    pub tag: String,
+    pub path: PathBuf,
+    pub read_only: bool,
 }
 
 /// A virtio-net device backed by a unixstream userspace network proxy
@@ -86,6 +97,7 @@ struct Krun {
     add_vsock_port2: unsafe extern "C" fn(u32, u32, *const c_char, bool) -> i32,
     set_console_output: unsafe extern "C" fn(u32, *const c_char) -> i32,
     add_net_unixstream: unsafe extern "C" fn(u32, *const c_char, i32, *const u8, u32, u32) -> i32,
+    add_virtiofs3: unsafe extern "C" fn(u32, *const c_char, *const c_char, u64, bool) -> i32,
     start_enter: unsafe extern "C" fn(u32) -> i32,
 }
 
@@ -113,6 +125,7 @@ impl Krun {
                 add_vsock_port2: sym(h, "krun_add_vsock_port2")?,
                 set_console_output: sym(h, "krun_set_console_output")?,
                 add_net_unixstream: sym(h, "krun_add_net_unixstream")?,
+                add_virtiofs3: sym(h, "krun_add_virtiofs3")?,
                 start_enter: sym(h, "krun_start_enter")?,
             })
         }
@@ -172,6 +185,17 @@ pub fn run(cfg: &VmConfig) -> Result<std::convert::Infallible, Error> {
     let kernel = cstr(&cfg.kernel)?;
     let initramfs = cstr(&cfg.initramfs)?;
     let cmdline = CString::new(cfg.cmdline.as_str()).map_err(|_| Error("bad cmdline".into()))?;
+    let shares: Vec<(CString, CString, bool)> = cfg
+        .shares
+        .iter()
+        .map(|sh| {
+            Ok((
+                CString::new(sh.tag.as_str()).map_err(|_| Error("bad share tag".into()))?,
+                cstr(&sh.path)?,
+                sh.read_only,
+            ))
+        })
+        .collect::<Result<_, Error>>()?;
     let ports: Vec<(u32, CString, bool)> = cfg
         .vsock_ports
         .iter()
@@ -214,6 +238,13 @@ pub fn run(cfg: &VmConfig) -> Result<std::convert::Infallible, Error> {
             check(
                 "add_disk",
                 (k.add_disk)(ctx, id.as_ptr(), path.as_ptr(), *ro),
+            )?;
+        }
+        for (tag, path, ro) in &shares {
+            // No DAX window (shm_size 0) for now.
+            check(
+                "add_virtiofs3",
+                (k.add_virtiofs3)(ctx, tag.as_ptr(), path.as_ptr(), 0, *ro),
             )?;
         }
         if let Some(net) = &cfg.net {

@@ -219,3 +219,75 @@ fn guest_ports_are_forwarded() {
         None
     }
 }
+
+#[test]
+#[ignore]
+fn shared_folders() {
+    use std::os::unix::fs::MetadataExt;
+
+    let base = std::env::temp_dir().join(format!("runt-test-share-{}", std::process::id()));
+    let rw = base.join("project");
+    let ro = base.join("readonly");
+    std::fs::create_dir_all(rw.join("sub")).unwrap();
+    std::fs::create_dir_all(&ro).unwrap();
+    std::fs::write(rw.join("hello.txt"), "from host\n").unwrap();
+    std::fs::write(ro.join("data.txt"), "read only\n").unwrap();
+    let rw = rw.canonicalize().unwrap();
+    let rw_s = rw.to_str().unwrap().to_string();
+
+    let name = format!("test-share-{}", std::process::id());
+    let o = Command::new(env!("CARGO_BIN_EXE_runt"))
+        .args(["new", &name, "--mem", "512M", "--mount", "."])
+        .arg("--mount")
+        .arg(format!("{}:/data:ro", ro.display()))
+        .current_dir(&rw)
+        .output()
+        .unwrap();
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+    let vm = Vm(name);
+
+    // Host -> guest, at the same path.
+    let (code, out) = vm_exec(&vm, &format!("cat {rw_s}/hello.txt"));
+    assert_eq!((code, out.as_str()), (Some(0), "from host\n"));
+
+    // Guest -> host, owned by the host user.
+    vm_exec(&vm, &format!("echo from guest > {rw_s}/guest.txt"));
+    let written = rw.join("guest.txt");
+    assert_eq!(std::fs::read_to_string(&written).unwrap(), "from guest\n");
+    // SAFETY: getuid never fails.
+    let me = unsafe { libc::getuid() };
+    assert_eq!(std::fs::metadata(&written).unwrap().uid(), me);
+
+    // Read-only share: even after a guest remount, writes are refused.
+    let (code, _) = vm_exec(&vm, "mount -o remount,rw /data; echo x > /data/new.txt");
+    assert_ne!(code, Some(0));
+    assert!(!ro.join("new.txt").exists());
+
+    // `runt exec` starts where you are, when that's inside a mount.
+    let pwd = |dir: &std::path::Path| {
+        let o = Command::new(env!("CARGO_BIN_EXE_runt"))
+            .args(["exec", &vm.0, "--", "pwd"])
+            .current_dir(dir)
+            .output()
+            .unwrap();
+        stdout(&o)
+    };
+    assert_eq!(pwd(&rw.join("sub")), format!("{rw_s}/sub\n"));
+    assert_eq!(pwd(std::path::Path::new("/")), "/root\n");
+
+    // `..` out of a mount stays in the guest: the host's sibling dir isn't there.
+    let (_, out) = vm_exec(&vm, &format!("ls -a {rw_s}/.."));
+    assert!(
+        !out.contains("readonly"),
+        "host parent leaked into guest: {out}"
+    );
+
+    // Mounts survive stop/start.
+    assert!(runt(&["stop", &vm.0]).status.success());
+    assert!(runt(&["start", &vm.0]).status.success());
+    let (_, out) = vm_exec(&vm, &format!("cat {rw_s}/guest.txt /data/data.txt"));
+    assert_eq!(out, "from guest\nread only\n");
+
+    drop(vm);
+    let _ = std::fs::remove_dir_all(&base);
+}

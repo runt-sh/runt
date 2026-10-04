@@ -5,6 +5,7 @@
 
 mod boot;
 mod exec;
+mod mounts;
 mod net;
 mod ports;
 mod sys;
