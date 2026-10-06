@@ -7,8 +7,8 @@ from an agent, see `skills/runt/SKILL.md` (also printed by `runt skill`).
 
 | Path | What |
 | --- | --- |
-| `crates/runt-cli` | The `runt` binary: commands, VM lifecycle (`vm.rs`), on-disk state (`state.rs`), MCP server (`mcp.rs`), shared operations (`ops.rs`) |
-| `crates/runt-agent` | PID 1 inside the guest (static musl): boot, mounts, networking, exec server, port watcher |
+| `crates/runt-cli` | The `runt` binary: commands, VM lifecycle (`vm.rs`), on-disk state (`state.rs`), MCP server (`mcp.rs`), shared operations (`ops.rs`), `runt.toml` (`recipe.rs`), the image builder (`build.rs`, guest half `build.sh`, inputs via `tar.rs`), `runt up`/`down` (`project.rs`) |
+| `crates/runt-agent` | PID 1 inside the guest (static musl): boot (overlay of base, recipe layers and the VM's disk), mounts, networking, exec server, port watcher, services |
 | `crates/runt-proto` | Host/guest wire protocol: framed, multiplexed, credit-based flow control |
 | `crates/runt-vmm` | libkrun bindings (loaded with dlopen at runtime) |
 | `crates/runt-net` | Userspace networking and egress policy; the only crate that names `smolvm-network` |
@@ -35,8 +35,8 @@ to `crates/runt-agent` only reach VMs after `make initramfs`.
   prompts without a TTY. runt's own errors exit 125 with a stable `code` and
   a `hint` (`CliError` in `error.rs`); `runt exec` passes the guest's exit
   code through.
-- **Small and fast.** The `runt` binary is about 1.6 MB and VMs boot in about
-  130 ms. Measure before and after anything that could change either, and
+- **Small and fast.** The `runt` binary is about 2.1 MB and VMs boot in about
+  150 ms. Measure before and after anything that could change either, and
   justify new dependencies.
 - **The sandbox is real.** Each VM's supervisor confines itself
   (`vm::confine`) before booting. Anything the supervisor needs to open after
@@ -48,6 +48,9 @@ to `crates/runt-agent` only reach VMs after `make initramfs`.
   boundary.
 - **Old `vm.json` files must keep loading:** new `VmRecord` fields get
   `#[serde(default)]`.
+- **Layer keys are a cache contract.** Anything that changes what a build
+  step produces must change its key (`build::layer_keys`); bump `FORMAT` in
+  `build.rs` when `build.sh` changes what layers contain.
 - **smolvm-network is pinned exactly.** Read its source before relying on
   behaviour, and keep its types inside `runt-net`.
 
@@ -55,6 +58,8 @@ to `crates/runt-agent` only reach VMs after `make initramfs`.
 
 - VM tests name VMs `test-<tag>-<pid>` and remove them on drop. Check
   `runt ls` afterwards for leftovers.
+- Build layers are shared by every project with the same steps. Tests that
+  assert on caching should make their first step unique to the run.
 - Don't kill processes with `pkill -f` patterns that also match your own
   shell's command line.
 - Benchmarks must remove the VMs they create.

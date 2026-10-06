@@ -49,6 +49,12 @@ pub fn serve(conn: File) {
             }
         }
         Ok(Event::Msg(Msg::Shutdown)) => crate::shutdown(),
+        Ok(Event::Msg(Msg::SetServices(specs))) => {
+            let _ = mux.send(&Msg::ServiceList(crate::services::set(specs)));
+        }
+        Ok(Event::Msg(Msg::GetServices)) => {
+            let _ = mux.send(&Msg::ServiceList(crate::services::list()));
+        }
         Ok(Event::Msg(Msg::Connect { port })) => {
             if let Err(e) = crate::ports::splice(&mux, &rx, port) {
                 let _ = mux.send(&Msg::Error {
@@ -68,7 +74,7 @@ fn exec(mux: &Mux, rx: &Receiver<Event>, req: ExecRequest) -> io::Result<()> {
     if req.argv.is_empty() {
         return Err(io::Error::new(io::ErrorKind::InvalidInput, "empty command"));
     }
-    let env = build_env(&req);
+    let env = build_env(&req.env, req.tty.is_some());
     let path_var = env
         .iter()
         .find(|(k, _)| k == "PATH")
@@ -319,7 +325,8 @@ fn finish_early(mux: &Mux, stderr_msg: &str, code: i32) -> io::Result<()> {
     })
 }
 
-fn build_env(req: &ExecRequest) -> Vec<(String, String)> {
+/// The environment for a command: runt's defaults, overridden by `extra`.
+pub fn build_env(extra: &[(String, String)], tty: bool) -> Vec<(String, String)> {
     let mut env: Vec<(String, String)> = [
         ("PATH", DEFAULT_PATH),
         ("HOME", "/root"),
@@ -331,10 +338,10 @@ fn build_env(req: &ExecRequest) -> Vec<(String, String)> {
     .into_iter()
     .map(|(k, v)| (k.to_string(), v.to_string()))
     .collect();
-    if req.tty.is_some() {
+    if tty {
         env.push(("TERM".into(), "xterm-256color".into()));
     }
-    for (k, v) in &req.env {
+    for (k, v) in extra {
         env.retain(|(ek, _)| ek != k);
         env.push((k.clone(), v.clone()));
     }
@@ -343,7 +350,7 @@ fn build_env(req: &ExecRequest) -> Vec<(String, String)> {
 
 /// Find `cmd` the way execvp would, so a missing command is reported as
 /// 127 without forking.
-fn resolve(cmd: &str, path_var: &str) -> Option<PathBuf> {
+pub fn resolve(cmd: &str, path_var: &str) -> Option<PathBuf> {
     if cmd.contains('/') {
         return Some(PathBuf::from(cmd));
     }
@@ -377,7 +384,7 @@ mod tests {
             ],
             ..Default::default()
         };
-        let env = build_env(&req);
+        let env = build_env(&req.env, req.tty.is_some());
         assert_eq!(env.iter().filter(|(k, _)| k == "PATH").count(), 1);
         assert!(env.contains(&("PATH".into(), "/opt/bin".into())));
         assert!(env.contains(&("FOO".into(), "1".into())));

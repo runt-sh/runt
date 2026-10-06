@@ -61,7 +61,7 @@ pub fn create(
             net,
             mounts,
             egress,
-            created_by: None,
+            ..Default::default()
         };
         state::save(&rec)?;
         Ok(rec)
@@ -116,6 +116,21 @@ pub fn start(rec: &mut VmRecord) -> Result<u128> {
         ));
     }
     runt_vmm::probe().map_err(|e| CliError::new("libkrun_missing", e.to_string()))?;
+    if let Some(missing) = extra_disks(rec).into_iter().find(|p| !p.is_file()) {
+        let hint = match &rec.project {
+            Some(dir) => format!("rebuild it with `runt up` in {}", dir.display()),
+            None => format!("remove it with `runt rm {}`", rec.name),
+        };
+        return Err(CliError::new(
+            "image_missing",
+            format!(
+                "VM {:?} needs {}, which is gone",
+                rec.name,
+                missing.display()
+            ),
+        )
+        .hint(hint));
+    }
     let dir = state::vm_dir(&rec.name);
     let sock = state::socket_path(&rec.name);
     // A fresh, private runtime dir per boot: the VM's sandbox is granted
@@ -162,7 +177,11 @@ pub fn start(rec: &mut VmRecord) -> Result<u128> {
         Ok(()) => {
             // The agent is serving; confirm with a real handshake.
             client::connect(&rec.name, &sock)?;
-            Ok(t0.elapsed().as_millis())
+            let ms = t0.elapsed().as_millis();
+            if !rec.services.is_empty() {
+                client::set_services(rec)?;
+            }
+            Ok(ms)
         }
         Err(why) => {
             if child.try_wait().ok().flatten().is_none() {
@@ -244,7 +263,29 @@ pub fn supervise(name: &str) -> Result<()> {
         cmdline.push(' ');
         cmdline.push_str(&fs);
     }
+    if !rec.layers.is_empty() {
+        cmdline.push_str(&format!(" runt.layers={}", rec.layers.len()));
+    }
     mounts::check_cmdline_len(&cmdline)?;
+    let mut disks = vec![
+        runt_vmm::Disk {
+            id: "base".into(),
+            path: assets.image.clone(),
+            read_only: true,
+        },
+        runt_vmm::Disk {
+            id: "upper".into(),
+            path: dir.join("upper.ext4"),
+            read_only: false,
+        },
+    ];
+    for (i, path) in extra_disks(&rec).into_iter().enumerate() {
+        disks.push(runt_vmm::Disk {
+            id: format!("ro{i}"),
+            path,
+            read_only: true,
+        });
+    }
     ports::start(name)
         .map_err(|e| CliError::new("ports_failed", format!("cannot start port forwarding: {e}")))?;
     let cfg = runt_vmm::VmConfig {
@@ -253,18 +294,7 @@ pub fn supervise(name: &str) -> Result<()> {
         kernel: assets.kernel,
         initramfs: assets.initramfs,
         cmdline,
-        disks: vec![
-            runt_vmm::Disk {
-                id: "base".into(),
-                path: assets.image,
-                read_only: true,
-            },
-            runt_vmm::Disk {
-                id: "upper".into(),
-                path: dir.join("upper.ext4"),
-                read_only: false,
-            },
-        ],
+        disks,
         vsock_ports: vec![
             runt_vmm::VsockPort {
                 port: runt_proto::AGENT_PORT,
@@ -330,19 +360,32 @@ fn confine(rec: &VmRecord, assets: &state::Assets, dir: &Path) {
     );
 }
 
+/// Read-only disks after the base and the VM's own: its image layers
+/// (vdc, vdd, ...), then any others.
+fn extra_disks(rec: &VmRecord) -> Vec<PathBuf> {
+    rec.layers
+        .iter()
+        .map(|k| state::layer_path(k))
+        .chain(rec.disks.iter().cloned())
+        .collect()
+}
+
 /// Everything a VM's process may touch: its own state and runtime dirs, its
-/// kernel and image, /dev/kvm, and the folders the user shared.
+/// kernel, image and layers, /dev/kvm, and the folders the user shared.
 pub fn sandbox_policy(rec: &VmRecord, assets: &state::Assets, dir: &Path) -> runt_sandbox::Policy {
     let (rw_shares, ro_shares): (Vec<&Mount>, Vec<&Mount>) =
         rec.mounts.iter().partition(|m| !m.read_only);
     let mut rw_dirs = vec![dir.to_path_buf(), state::vm_runtime_dir(&rec.name)];
     rw_dirs.extend(rw_shares.iter().map(|m| m.src.clone()));
     runt_sandbox::Policy {
-        read_files: vec![
+        read_files: [
             assets.kernel.clone(),
             assets.initramfs.clone(),
             assets.image.clone(),
-        ],
+        ]
+        .into_iter()
+        .chain(extra_disks(rec))
+        .collect(),
         rw_dirs,
         ro_dirs: ro_shares.iter().map(|m| m.src.clone()).collect(),
         devices: vec![PathBuf::from("/dev/kvm")],

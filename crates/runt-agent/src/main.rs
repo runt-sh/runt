@@ -1,13 +1,15 @@
 //! runt-agent: PID 1 inside every runt VM.
 //!
 //! Boots the guest (overlay root on the base image + per-VM disk), then
-//! serves the runt protocol on vsock: exec sessions and shutdown.
+//! serves the runt protocol on vsock: exec sessions, port forwarding,
+//! services and shutdown.
 
 mod boot;
 mod exec;
 mod mounts;
 mod net;
 mod ports;
+mod services;
 mod sys;
 
 use std::thread;

@@ -1,5 +1,6 @@
 //! runt: tiny, fast microVMs for agents and humans.
 
+mod build;
 mod client;
 mod error;
 mod mcp;
@@ -7,7 +8,10 @@ mod mounts;
 mod names;
 mod ops;
 mod ports;
+mod project;
+mod recipe;
 mod state;
+mod tar;
 mod term;
 mod vm;
 
@@ -108,12 +112,30 @@ enum Cmd {
         #[arg(short, long)]
         force: bool,
     },
-    /// Print a VM's console log
+    /// Print a VM's console log, a service's output, or refused connections
     Logs {
         vm: String,
         /// Show connections and DNS lookups the VM's network policy refused
-        #[arg(long)]
+        #[arg(long, conflicts_with = "service")]
         egress: bool,
+        /// Show this service's output (services come from runt.toml)
+        #[arg(short, long, value_name = "NAME")]
+        service: Option<String>,
+        /// Keep printing new output (with --service)
+        #[arg(short, long, requires = "service")]
+        follow: bool,
+    },
+    /// Build the image in runt.toml (here or in a parent directory); steps
+    /// whose inputs haven't changed come from the cache
+    Build,
+    /// Build runt.toml and run it: create or update the project's VM and
+    /// start its services
+    Up,
+    /// Stop the project's VM (its disk is kept)
+    Down {
+        /// Remove the VM and its disk instead
+        #[arg(long)]
+        rm: bool,
     },
     /// List ports forwarded from a VM to this machine (automatic: any port
     /// the guest listens on appears on 127.0.0.1)
@@ -205,6 +227,7 @@ fn run(cli: Cli) -> Result<i32> {
                 egress: state::Egress::new(&allow, allow_lan)?,
                 mounts,
                 created_by: None,
+                ..Default::default()
             })?;
             if json {
                 print_json(ops::created_json(&rec, boot_ms));
@@ -298,7 +321,14 @@ fn run(cli: Cli) -> Result<i32> {
         }
         Cmd::Logs {
             vm: name,
+            service: Some(service),
+            follow,
+            ..
+        } => service_logs(&name, &service, follow, json),
+        Cmd::Logs {
+            vm: name,
             egress: true,
+            ..
         } => {
             state::load(&name)?;
             let log = std::fs::read_to_string(state::egress_log_path(&name)).unwrap_or_default();
@@ -317,6 +347,72 @@ fn run(cli: Cli) -> Result<i32> {
                 print_json(json!({ "name": name, "console": String::from_utf8_lossy(&log) }));
             } else {
                 std::io::stdout().write_all(&log)?;
+            }
+            Ok(0)
+        }
+        Cmd::Build => {
+            let r = recipe::load(&recipe::find(&std::env::current_dir()?)?)?;
+            let b = build::build(&r, !json)?;
+            if json {
+                print_json(json!({
+                    "name": r.name, "layers": b.layers, "steps": r.steps.len(),
+                    "cached": b.cached, "ms": b.ms, "log": b.log,
+                }));
+            }
+            Ok(0)
+        }
+        Cmd::Up => {
+            let r = recipe::load(&recipe::find(&std::env::current_dir()?)?)?;
+            let up = project::up(&r, !json)?;
+            let name = &up.rec.name;
+            let maps = ports::read(name);
+            if json {
+                print_json(json!({
+                    "name": name, "status": "running", "action": up.action,
+                    "reason": up.reason, "boot_ms": up.boot_ms,
+                    "build": { "layers": up.built.layers, "cached": up.built.cached,
+                               "ms": up.built.ms, "log": up.built.log },
+                    "services": ops::services_json(&up.services),
+                    "ports": maps.iter()
+                        .map(|m| json!({ "guest": m.guest, "host": m.host, "url": m.url() }))
+                        .collect::<Vec<_>>(),
+                }));
+            } else {
+                let how = match (up.action, up.reason, up.boot_ms) {
+                    ("unchanged", ..) => "already up to date".to_string(),
+                    (a, Some(why), Some(ms)) => format!("{a} ({why}) and booted in {ms} ms"),
+                    (a, Some(why), None) => format!("{a} ({why})"),
+                    (a, None, Some(ms)) => format!("{a} and booted in {ms} ms"),
+                    (a, None, None) => a.to_string(),
+                };
+                eprintln!("{name} is up: {how}");
+                if up.action == "recreated" {
+                    eprintln!("  (the VM's own disk starts fresh with a new image)");
+                }
+                for s in &up.services {
+                    eprintln!("  service {}", project::describe(s));
+                }
+                for m in &maps {
+                    eprintln!("  {} -> port {} in the VM", m.url(), m.guest);
+                }
+                if let Some(s) = up.services.first() {
+                    eprintln!("logs: runt logs {name} -s {}", s.name);
+                }
+            }
+            Ok(0)
+        }
+        Cmd::Down { rm } => {
+            let r = recipe::load(&recipe::find(&std::env::current_dir()?)?)?;
+            let existed = project::down(&r, rm)?;
+            let status = match (existed, rm) {
+                (false, _) => "absent",
+                (true, true) => "removed",
+                (true, false) => "stopped",
+            };
+            if json {
+                print_json(json!({ "name": r.name, "status": status }));
+            } else {
+                eprintln!("{}: {status}", r.name);
             }
             Ok(0)
         }
@@ -451,7 +547,7 @@ fn exec(
         mounts::default_workdir(&here, &rec.mounts).map(|p| p.to_string_lossy().into_owned())
     });
     let conn = client::connect(name, &state::socket_path(name))?;
-    let mut env = env;
+    let mut env = ops::exec_env(&rec, env);
     if tty && let Ok(t) = std::env::var("TERM") {
         env.insert(0, ("TERM".into(), t));
     }
@@ -481,6 +577,50 @@ fn exec(
         }));
     }
     Ok(code)
+}
+
+/// `runt logs VM --service NAME`: the service's log, read inside the VM.
+fn service_logs(name: &str, service: &str, follow: bool, json: bool) -> Result<i32> {
+    let rec = state::load(name)?;
+    if !rec.services.iter().any(|s| s.name == service) {
+        let names: Vec<_> = rec.services.iter().map(|s| s.name.as_str()).collect();
+        let hint = if names.is_empty() {
+            "this VM has no services; they come from runt.toml (`runt up`)".to_string()
+        } else {
+            format!("its services: {}", names.join(", "))
+        };
+        return Err(CliError::new(
+            "no_service",
+            format!("VM {name:?} has no service {service:?}"),
+        )
+        .hint(hint));
+    }
+    let log = format!("/var/log/runt/{service}.log");
+    let argv = if follow {
+        vec!["tail", "-n", "+1", "-F", &log]
+    } else {
+        // A service that hasn't written anything has no log yet.
+        vec!["sh", "-c", "[ ! -e \"$1\" ] || cat \"$1\"", "sh", &log]
+    };
+    let argv = argv.into_iter().map(String::from).collect();
+    if json {
+        let conn = client::connect(name, &state::socket_path(name))?;
+        let r = client::run_captured(
+            conn,
+            client::ExecOpts {
+                argv,
+                env: vec![],
+                cwd: None,
+                tty: false,
+            },
+            vec![],
+            std::time::Duration::from_secs(30),
+            1 << 20,
+        )?;
+        print_json(json!({ "name": name, "service": service, "log": r.stdout.text() }));
+        return Ok(0);
+    }
+    exec(name, argv, vec![], Some("/".into()), false, false)
 }
 
 fn report(json: bool, name: &str, status: Status, boot_ms: Option<u128>) {
@@ -529,7 +669,7 @@ fn parse_env(s: &str) -> Result<(String, String)> {
 }
 
 /// Parse sizes like "512M", "2G", "1024" (MiB) into MiB.
-fn parse_mem(s: &str) -> std::result::Result<u32, String> {
+pub fn parse_mem(s: &str) -> std::result::Result<u32, String> {
     let s = s.trim();
     let (num, mult) = match s.char_indices().last() {
         Some((i, 'G' | 'g')) => (&s[..i], 1024),

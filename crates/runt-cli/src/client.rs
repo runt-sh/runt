@@ -7,7 +7,9 @@ use std::sync::mpsc::Receiver;
 use std::thread;
 use std::time::Duration;
 
-use runt_proto::{Event, ExecRequest, Msg, Mux, STDERR, STDIN, STDOUT, WinSize};
+use runt_proto::{
+    Event, ExecRequest, Msg, Mux, STDERR, STDIN, STDOUT, Service, ServiceStatus, WinSize,
+};
 
 use crate::error::{CliError, Result};
 use crate::term;
@@ -47,6 +49,45 @@ pub fn connect(name: &str, sock: &Path) -> Result<Conn> {
 pub fn shutdown(conn: &Conn) -> Result<()> {
     conn.mux.send(&Msg::Shutdown)?;
     Ok(())
+}
+
+/// Make the VM's recorded services its running set; returns their state.
+pub fn set_services(rec: &crate::state::VmRecord) -> Result<Vec<ServiceStatus>> {
+    let specs = rec
+        .services
+        .iter()
+        .map(|s| Service {
+            name: s.name.clone(),
+            argv: vec!["/bin/sh".into(), "-c".into(), s.cmd.clone()],
+            env: rec
+                .env
+                .iter()
+                .chain(&s.env)
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect(),
+            cwd: s.cwd.clone(),
+            restart: s.restart.proto(),
+        })
+        .collect();
+    service_request(&rec.name, Msg::SetServices(specs))
+}
+
+pub fn get_services(name: &str) -> Result<Vec<ServiceStatus>> {
+    service_request(name, Msg::GetServices)
+}
+
+fn service_request(name: &str, msg: Msg) -> Result<Vec<ServiceStatus>> {
+    let conn = connect(name, &crate::state::socket_path(name))?;
+    conn.mux.send(&msg)?;
+    // Replacing services waits for old ones to stop (5 s grace each).
+    match conn.rx.recv_timeout(Duration::from_secs(60)) {
+        Ok(Event::Msg(Msg::ServiceList(list))) => Ok(list),
+        _ => Err(CliError::new(
+            "agent_unreachable",
+            format!("VM {name:?} didn't answer about its services"),
+        )
+        .hint("the VM's agent may be too old; rebuild assets with `make assets`")),
+    }
 }
 
 /// Where command output goes.
@@ -174,6 +215,40 @@ pub fn exec(conn: Conn, opts: ExecOpts, out: &mut Output) -> Result<i32> {
             "lost connection to the VM before the command finished",
         )
     })
+}
+
+/// Run a non-interactive command with no stdin, handing its output (stdout
+/// and stderr interleaved) to `sink` as it arrives. Returns the exit code.
+pub fn run_streamed(conn: Conn, opts: ExecOpts, sink: &mut dyn FnMut(&[u8])) -> Result<i32> {
+    let Conn { mux, rx } = conn;
+    mux.send(&Msg::Exec(ExecRequest {
+        argv: opts.argv,
+        env: opts.env,
+        cwd: opts.cwd,
+        tty: None,
+    }))?;
+    mux.send_eof(STDIN)?;
+    loop {
+        match rx.recv() {
+            Ok(Event::Data(stream, d)) => {
+                sink(&d);
+                let _ = mux.grant(stream, d.len());
+            }
+            Ok(Event::Msg(Msg::Exit { code, signal })) => {
+                return Ok(code.unwrap_or(128 + signal.unwrap_or(0)));
+            }
+            Ok(Event::Msg(Msg::Error { message })) => {
+                return Err(CliError::new("exec_failed", message));
+            }
+            Ok(Event::Closed) | Err(_) => {
+                return Err(CliError::new(
+                    "connection_lost",
+                    "lost connection to the VM before the command finished",
+                ));
+            }
+            Ok(_) => {}
+        }
+    }
 }
 
 /// Output of [`run_captured`].
