@@ -32,15 +32,20 @@ $ runt exec --json nimble-shrew -- sh -c 'echo hi; exit 3'
 | `runt port VM` | Ports forwarded from the VM to this machine |
 | `runt logs VM [--egress]` | Guest console log, or refused network connections |
 | `runt mcp` | MCP server for AI agents (see below) |
+| `runt skill [--install]` | Print or install the agent skill (see below) |
 
 Add `--json` to any command for machine-readable output. runt's own errors
 exit with 125 and, in JSON mode, print `{"error": {"code", "message", "hint"}}`
 to stderr.
 
-## AI agents (MCP)
+## AI agents
 
-Agents that can run shell commands can use the CLI directly. For agents that
-use tools, `runt mcp` is a [Model Context Protocol](https://modelcontextprotocol.io)
+Agents that can run shell commands can use the CLI directly. `runt skill`
+prints a short guide for them. `runt skill --install` installs it as a Claude
+Code skill in `~/.claude/skills/runt/`; for other agents, paste it into their
+instructions.
+
+For agents that use tools, `runt mcp` is a [Model Context Protocol](https://modelcontextprotocol.io)
 server on stdio with seven small tools: `vm_create`, `vm_exec`, `vm_list`,
 `vm_start`, `vm_stop`, `vm_remove` and `vm_logs`.
 
@@ -57,6 +62,8 @@ You stay in charge of what an agent can reach on your machine:
   (or those given with `--mount-root DIR`).
 - **LAN:** agents can't open LAN access unless you start the server with
   `--allow-lan`.
+- **VMs:** agents see and manage only the VMs they created. Use `--vm NAME`
+  to also hand them an existing VM, or `--all-vms` to give them all of yours.
 - **Output:** `vm_exec` keeps the first and last 32 KiB of each output
   stream and has a timeout (default 120 s).
 - **Workdir:** commands start in the same directory as the server when that

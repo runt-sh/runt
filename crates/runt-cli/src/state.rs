@@ -34,6 +34,9 @@ pub struct VmRecord {
     pub mounts: Vec<crate::mounts::Mount>,
     #[serde(default)]
     pub egress: Egress,
+    /// What created the VM, if not a person at the CLI (`"mcp"`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub created_by: Option<String>,
 }
 
 /// What a NAT VM's network may reach beyond the default (public internet).
