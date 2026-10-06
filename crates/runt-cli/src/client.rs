@@ -175,3 +175,154 @@ pub fn exec(conn: Conn, opts: ExecOpts, out: &mut Output) -> Result<i32> {
         )
     })
 }
+
+/// Output of [`run_captured`].
+pub struct Captured {
+    /// Exit code (128+N if killed by signal N); None if the timeout hit.
+    pub code: Option<i32>,
+    pub stdout: Clipped,
+    pub stderr: Clipped,
+}
+
+/// A byte stream kept within a budget: the start and the end survive, the
+/// middle is dropped (errors tend to be at the end, context at the start).
+pub struct Clipped {
+    head: Vec<u8>,
+    tail: std::collections::VecDeque<u8>,
+    total: usize,
+    half: usize,
+}
+
+impl Clipped {
+    pub fn new(limit: usize) -> Clipped {
+        Clipped {
+            head: Vec::new(),
+            tail: std::collections::VecDeque::new(),
+            total: 0,
+            half: limit / 2,
+        }
+    }
+
+    fn push(&mut self, mut d: &[u8]) {
+        self.total += d.len();
+        let room = self.half.saturating_sub(self.head.len());
+        let n = room.min(d.len());
+        self.head.extend_from_slice(&d[..n]);
+        d = &d[n..];
+        self.tail.extend(d);
+        let excess = self.tail.len().saturating_sub(self.half);
+        self.tail.drain(..excess);
+    }
+
+    /// Bytes dropped from the middle.
+    pub fn omitted(&self) -> usize {
+        self.total - self.head.len() - self.tail.len()
+    }
+
+    /// The kept text, with a marker where bytes were dropped.
+    pub fn text(&self) -> String {
+        let mut s = String::from_utf8_lossy(&self.head).into_owned();
+        if self.omitted() > 0 {
+            s.push_str(&format!("\n[... {} bytes omitted ...]\n", self.omitted()));
+        }
+        let (a, b) = self.tail.as_slices();
+        s.push_str(&String::from_utf8_lossy(&[a, b].concat()));
+        s
+    }
+}
+
+/// Run a non-interactive command with the given stdin, collecting at most
+/// `limit` bytes of each output stream. Never touches this process's stdin
+/// or signals. On timeout the command's process group is killed.
+pub fn run_captured(
+    conn: Conn,
+    opts: ExecOpts,
+    stdin: Vec<u8>,
+    timeout: Duration,
+    limit: usize,
+) -> Result<Captured> {
+    let Conn { mux, rx } = conn;
+    mux.send(&Msg::Exec(ExecRequest {
+        argv: opts.argv,
+        env: opts.env,
+        cwd: opts.cwd,
+        tty: None,
+    }))?;
+    {
+        let mux = mux.clone();
+        thread::spawn(move || {
+            for chunk in stdin.chunks(runt_proto::MAX_CHUNK) {
+                if mux.send_data(STDIN, chunk).is_err() {
+                    return;
+                }
+            }
+            let _ = mux.send_eof(STDIN);
+        });
+    }
+    let mut out = Captured {
+        code: None,
+        stdout: Clipped::new(limit),
+        stderr: Clipped::new(limit),
+    };
+    let deadline = std::time::Instant::now() + timeout;
+    let mut killed = false;
+    loop {
+        let wait = deadline.saturating_duration_since(std::time::Instant::now());
+        let ev = match rx.recv_timeout(if killed { Duration::from_secs(2) } else { wait }) {
+            Ok(ev) => ev,
+            Err(_) if !killed => {
+                // Timed out: kill it, then collect what's left and the exit.
+                mux.send(&Msg::Signal {
+                    signo: libc::SIGKILL,
+                })?;
+                killed = true;
+                continue;
+            }
+            Err(_) => break,
+        };
+        match ev {
+            Event::Data(stream, d) => {
+                match stream {
+                    STDOUT => out.stdout.push(&d),
+                    STDERR => out.stderr.push(&d),
+                    _ => {}
+                }
+                let _ = mux.grant(stream, d.len());
+            }
+            Event::Msg(Msg::Exit { code, signal }) => {
+                if !killed {
+                    out.code = Some(code.unwrap_or(128 + signal.unwrap_or(0)));
+                }
+                return Ok(out);
+            }
+            Event::Msg(Msg::Error { message }) => {
+                return Err(CliError::new("exec_failed", message));
+            }
+            Event::Closed if killed => return Ok(out),
+            Event::Closed => {
+                return Err(CliError::new(
+                    "connection_lost",
+                    "lost connection to the VM before the command finished",
+                ));
+            }
+            _ => {}
+        }
+    }
+    Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn clips_the_middle() {
+        let mut c = Clipped::new(8);
+        c.push(b"abc");
+        assert_eq!((c.text().as_str(), c.omitted()), ("abc", 0));
+        c.push(b"defghij");
+        c.push(b"klmn");
+        assert_eq!(c.omitted(), 6);
+        assert_eq!(c.text(), "abcd\n[... 6 bytes omitted ...]\nklmn");
+    }
+}

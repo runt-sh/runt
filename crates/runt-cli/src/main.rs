@@ -2,8 +2,10 @@
 
 mod client;
 mod error;
+mod mcp;
 mod mounts;
 mod names;
+mod ops;
 mod ports;
 mod state;
 mod term;
@@ -116,6 +118,17 @@ enum Cmd {
     /// the guest listens on appears on 127.0.0.1)
     #[command(alias = "ports")]
     Port { vm: String },
+    /// Serve the Model Context Protocol on stdin/stdout, so AI agents can
+    /// create and use VMs as tools
+    Mcp {
+        /// Directory agents may share into VMs (repeatable; default: the
+        /// current directory)
+        #[arg(long = "mount-root", value_name = "DIR")]
+        mount_roots: Vec<std::path::PathBuf>,
+        /// Let agents give VMs access to private networks (LAN, Tailscale)
+        #[arg(long)]
+        allow_lan: bool,
+    },
     #[command(name = "__vmm", hide = true)]
     Vmm { name: String },
     /// Apply a VM's sandbox to this process and try things it should and
@@ -156,10 +169,6 @@ fn run(cli: Cli) -> Result<i32> {
             allow_lan,
             mounts,
         } => {
-            let name = match name {
-                Some(n) => n,
-                None => unused_random_name(),
-            };
             let cwd = std::env::current_dir()?;
             let mounts = mounts
                 .iter()
@@ -170,29 +179,23 @@ fn run(cli: Cli) -> Result<i32> {
             {
                 eprintln!("runt: warning: sharing your entire home directory with the VM");
             }
-            let egress = state::Egress::new(&allow, allow_lan)?;
-            let mut rec = vm::create(&name, cpus, mem, net, egress, mounts)?;
-            let boot_ms = match vm::start(&mut rec) {
-                Ok(ms) => ms,
-                Err(e) => {
-                    let _ = vm::remove(&name, true);
-                    return Err(e);
-                }
-            };
+            let (rec, boot_ms) = ops::new_vm(ops::NewSpec {
+                name,
+                cpus,
+                mem_mib: mem,
+                net,
+                egress: state::Egress::new(&allow, allow_lan)?,
+                mounts,
+            })?;
             if json {
-                print_json(json!({
-                    "name": rec.name, "status": "running", "cpus": rec.cpus,
-                    "mem_mib": rec.mem_mib, "boot_ms": boot_ms, "mounts": rec.mounts,
-                    "egress": egress_json(&rec),
-                    "sandbox": vm::SandboxStatus::read(&rec.name),
-                }));
+                print_json(ops::created_json(&rec, boot_ms));
             } else {
                 println!("{}", rec.name);
                 for m in &rec.mounts {
                     let ro = if m.read_only { " (read-only)" } else { "" };
                     eprintln!("mounted {} at {}{ro}", m.src.display(), m.dst.display());
                 }
-                if let Some(e) = egress_summary(&rec) {
+                if let Some(e) = ops::egress_summary(&rec) {
                     eprintln!("network: {e}");
                 }
                 eprintln!("booted in {boot_ms} ms; try `runt shell {}`", rec.name);
@@ -233,28 +236,7 @@ fn run(cli: Cli) -> Result<i32> {
         Cmd::Ls => {
             let vms = state::list()?;
             if json {
-                let items: Vec<_> = vms
-                    .iter()
-                    .map(|r| {
-                        // Runtime files only describe a VM that is running.
-                        let status = state::status(r);
-                        let running = status == Status::Running;
-                        let ports = if running {
-                            ports::read(&r.name)
-                        } else {
-                            vec![]
-                        };
-                        json!({
-                            "name": r.name, "status": status, "cpus": r.cpus,
-                            "mem_mib": r.mem_mib, "created": r.created, "net": r.net,
-                            "mounts": r.mounts, "egress": egress_json(r),
-                            "sandbox": running.then(|| vm::SandboxStatus::read(&r.name)).flatten(),
-                            "ports": ports.iter()
-                                .map(|m| json!({ "guest": m.guest, "host": m.host }))
-                                .collect::<Vec<_>>(),
-                        })
-                    })
-                    .collect();
+                let items: Vec<_> = vms.iter().map(ops::vm_json).collect();
                 print_json(json!(items));
             } else if vms.is_empty() {
                 eprintln!("no VMs yet; create one with `runt new`");
@@ -387,6 +369,10 @@ fn run(cli: Cli) -> Result<i32> {
             }));
             Ok(0)
         }
+        Cmd::Mcp {
+            mount_roots,
+            allow_lan,
+        } => mcp::serve(mcp::Config::new(mount_roots, allow_lan)?).map(|()| 0),
         Cmd::Vmm { name } => vm::supervise(&name).map(|()| 0),
     }
 }
@@ -474,15 +460,6 @@ fn print_json(v: serde_json::Value) {
     println!("{v}");
 }
 
-fn unused_random_name() -> String {
-    loop {
-        let n = names::random();
-        if !state::vm_dir(&n).exists() {
-            return n;
-        }
-    }
-}
-
 fn parse_env(s: &str) -> Result<(String, String)> {
     match s.split_once('=') {
         Some((k, v)) if !k.is_empty() => Ok((k.into(), v.into())),
@@ -510,36 +487,6 @@ fn parse_mem(s: &str) -> std::result::Result<u32, String> {
         return Err("at least 128M of memory is needed".into());
     }
     Ok(mib)
-}
-
-/// `null` for offline VMs; otherwise what the network may reach.
-fn egress_json(rec: &state::VmRecord) -> serde_json::Value {
-    if rec.net == state::NetMode::None {
-        return serde_json::Value::Null;
-    }
-    json!({
-        "internet": if rec.egress.allow.is_empty() { "all" } else { "allowlist" },
-        "allow": rec.egress.allow,
-        "lan": rec.egress.lan,
-    })
-}
-
-/// One line for humans, when the policy isn't the default.
-fn egress_summary(rec: &state::VmRecord) -> Option<String> {
-    let e = &rec.egress;
-    if rec.net == state::NetMode::None || e.is_default() {
-        return None;
-    }
-    let mut parts = Vec::new();
-    if !e.allow.is_empty() {
-        parts.push(format!("only {}", e.allow.join(", ")));
-    } else {
-        parts.push("internet".into());
-    }
-    if e.lan {
-        parts.push("LAN".into());
-    }
-    Some(parts.join(" + "))
 }
 
 /// `[2026-10-04T12:00:00Z]: egress policy denied connect to 1.2.3.4:443`

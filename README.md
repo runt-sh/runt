@@ -30,11 +30,37 @@ $ runt exec --json nimble-shrew -- sh -c 'echo hi; exit 3'
 | `runt stop VM` / `runt start VM` | Shut down / boot again (the disk is kept) |
 | `runt rm [-f] VM` | Delete a VM and its disk |
 | `runt port VM` | Ports forwarded from the VM to this machine |
-| `runt logs VM` | Guest console log |
+| `runt logs VM [--egress]` | Guest console log, or refused network connections |
+| `runt mcp` | MCP server for AI agents (see below) |
 
 Add `--json` to any command for machine-readable output. runt's own errors
 exit with 125 and, in JSON mode, print `{"error": {"code", "message", "hint"}}`
 to stderr.
+
+## AI agents (MCP)
+
+Agents that can run shell commands can use the CLI directly. For agents that
+use tools, `runt mcp` is a [Model Context Protocol](https://modelcontextprotocol.io)
+server on stdio with seven small tools: `vm_create`, `vm_exec`, `vm_list`,
+`vm_start`, `vm_stop`, `vm_remove` and `vm_logs`.
+
+```sh
+# Claude Code, from your project directory
+claude mcp add runt -- runt mcp
+```
+
+Other clients take the usual config: `{"command": "runt", "args": ["mcp"]}`.
+
+You stay in charge of what an agent can reach on your machine:
+
+- **Shares:** agents may share only the directory `runt mcp` was started in
+  (or those given with `--mount-root DIR`).
+- **LAN:** agents can't open LAN access unless you start the server with
+  `--allow-lan`.
+- **Output:** `vm_exec` keeps the first and last 32 KiB of each output
+  stream and has a timeout (default 120 s).
+- **Workdir:** commands start in the same directory as the server when that
+  directory is shared.
 
 ## Shared folders
 

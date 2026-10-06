@@ -1,0 +1,137 @@
+<?xml version="1.0" encoding="UTF-8" standalone="no"?>
+<svg
+   viewBox="110 120 674.96216 174.73282"
+   role="img"
+   aria-labelledby="title desc"
+   version="1.1"
+   id="svg1"
+   sodipodi:docname="editable-runt-logo-light-orange-green.svg"
+   width="674.96216"
+   height="174.73282"
+   inkscape:version="1.4.4 (dcaf3e7d9e, 2026-05-05)"
+   inkscape:export-filename="../runt-logo.png"
+   inkscape:export-xdpi="96"
+   inkscape:export-ydpi="96"
+   xmlns:inkscape="http://www.inkscape.org/namespaces/inkscape"
+   xmlns:sodipodi="http://sodipodi.sourceforge.net/DTD/sodipodi-0.dtd"
+   xmlns="http://www.w3.org/2000/svg"
+   xmlns:svg="http://www.w3.org/2000/svg"
+   xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#"
+   xmlns:cc="http://creativecommons.org/ns#"
+   xmlns:dc="http://purl.org/dc/elements/1.1/">
+  <defs
+     id="defs1" />
+  <sodipodi:namedview
+     id="namedview1"
+     pagecolor="#ffffff"
+     bordercolor="#000000"
+     borderopacity="0.25"
+     inkscape:showpageshadow="2"
+     inkscape:pageopacity="0.0"
+     inkscape:pagecheckerboard="0"
+     inkscape:deskcolor="#d1d1d1"
+     showgrid="false"
+     inkscape:zoom="1"
+     inkscape:cx="624.5"
+     inkscape:cy="-141.5"
+     inkscape:window-width="1963"
+     inkscape:window-height="1190"
+     inkscape:window-x="26"
+     inkscape:window-y="23"
+     inkscape:window-maximized="0"
+     inkscape:current-layer="svg1">
+    <sodipodi:guide
+       position="-4.5582838,540.64997"
+       orientation="0,1490"
+       id="guide1"
+       inkscape:locked="false" />
+    <sodipodi:guide
+       position="1485.4417,540.64997"
+       orientation="360,0"
+       id="guide2"
+       inkscape:locked="false" />
+    <sodipodi:guide
+       position="1485.4417,180.64997"
+       orientation="0,-1490"
+       id="guide3"
+       inkscape:locked="false" />
+    <sodipodi:guide
+       position="-4.5582838,180.64997"
+       orientation="-360,0"
+       id="guide4"
+       inkscape:locked="false" />
+    <inkscape:grid
+       id="grid4"
+       units="px"
+       originx="-4.5582838"
+       originy="-180.64997"
+       spacingx="1"
+       spacingy="1"
+       empcolor="#0099e5"
+       empopacity="0.30196078"
+       color="#0099e5"
+       opacity="0.14901961"
+       empspacing="5"
+       enabled="true"
+       visible="false" />
+  </sodipodi:namedview>
+  <title
+     id="title">Runt logo</title>
+  <desc
+     id="desc">Angular rust-colored dog profile with a continuous dark echo or shadow and a transparent gap between the profiles.</desc>
+  <g
+     id="echo"
+     fill="#252729"
+     transform="matrix(0.53929877,0,0,0.53929877,41.509056,43.958873)"
+     style="fill:#82a300;fill-opacity:1">
+    <path
+       d="m 408.06919,141 h 55.52816 l 79.46242,108.84518 h 34.79618 V 316.7609 L 516.29349,383.67662 463,383 l 0.22453,82 H 410 v -82 h 53 l 61.32337,-66.2391 v -66.91572 h -37.4728 z"
+       id="path1"
+       sodipodi:nodetypes="ccccccccccccccc"
+       style="fill:#82a300;fill-opacity:1" />
+  </g>
+  <g
+     id="dog"
+     fill="#cb3e23"
+     transform="matrix(0.53929877,0,0,0.53929877,41.509056,43.958873)"
+     style="fill:#da6725;fill-opacity:1">
+    <path
+       id="ear"
+       d="m 271,150 -134,128 111,86 20,-20 z"
+       style="fill:#da6725;fill-opacity:1" />
+    <path
+       id="head"
+       fill-rule="evenodd"
+       d="m 282,141 h 102 l 86,122 h 37 v 52 l -52,53 h -65 v 97 H 127 l 75,-116 50,40 30,-31 z m 134.5,109.5 a 21.5,21.5 0 1 0 -43,0 21.5,21.5 0 1 0 43,0 z"
+       style="fill:#da6725;fill-opacity:1" />
+  </g>
+  <metadata
+     id="metadata1">
+    <rdf:RDF>
+      <cc:Work
+         rdf:about="">
+        <dc:title>Runt logo</dc:title>
+      </cc:Work>
+    </rdf:RDF>
+  </metadata>
+  <text
+     xml:space="preserve"
+     style="font-style:normal;font-variant:normal;font-weight:bold;font-stretch:normal;font-size:192px;font-family:'Momo Trust Display';-inkscape-font-specification:'Momo Trust Display Bold';writing-mode:lr-tb;direction:ltr;fill:#000000;fill-opacity:1"
+     x="388.48203"
+     y="291.85294"
+     id="text1"><tspan
+       sodipodi:role="line"
+       id="tspan1"
+       x="388.48203"
+       y="291.85294">runt</tspan></text>
+  <text
+     xml:space="preserve"
+     style="font-style:normal;font-variant:normal;font-weight:bold;font-stretch:normal;font-size:192px;font-family:Montserrat;-inkscape-font-specification:'Montserrat Bold';writing-mode:lr-tb;direction:ltr;fill:#000000;fill-opacity:1"
+     x="705.69171"
+     y="299.35004"
+     id="text4"><tspan
+       sodipodi:role="line"
+       id="tspan4"
+       x="705.69171"
+       y="299.35004" /></text>
+</svg>

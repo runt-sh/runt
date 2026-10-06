@@ -1,0 +1,69 @@
+<?xml version="1.0" encoding="UTF-8" standalone="no"?>
+<!-- Created with Inkscape (http://www.inkscape.org/) -->
+
+<svg
+   width="64mm"
+   height="64mm"
+   viewBox="0 0 64 64"
+   version="1.1"
+   id="svg1"
+   inkscape:version="1.4.4 (dcaf3e7d9e, 2026-05-05)"
+   sodipodi:docname="runt-icon.svg"
+   xmlns:inkscape="http://www.inkscape.org/namespaces/inkscape"
+   xmlns:sodipodi="http://sodipodi.sourceforge.net/DTD/sodipodi-0.dtd"
+   xmlns="http://www.w3.org/2000/svg"
+   xmlns:svg="http://www.w3.org/2000/svg">
+  <sodipodi:namedview
+     id="namedview1"
+     pagecolor="#ffffff"
+     bordercolor="#000000"
+     borderopacity="0.25"
+     inkscape:showpageshadow="2"
+     inkscape:pageopacity="0.0"
+     inkscape:pagecheckerboard="0"
+     inkscape:deskcolor="#d1d1d1"
+     inkscape:document-units="mm"
+     inkscape:zoom="1.2899551"
+     inkscape:cx="90.700831"
+     inkscape:cy="209.30961"
+     inkscape:window-width="3072"
+     inkscape:window-height="1659"
+     inkscape:window-x="0"
+     inkscape:window-y="0"
+     inkscape:window-maximized="1"
+     inkscape:current-layer="layer1" />
+  <defs
+     id="defs1" />
+  <g
+     inkscape:label="Layer 1"
+     inkscape:groupmode="layer"
+     id="layer1"
+     transform="translate(-80.962498,-93.133332)">
+    <g
+       id="echo"
+       fill="#252729"
+       transform="matrix(0.14268946,0,0,0.14268946,62.840937,81.898426)"
+       style="fill:#82a300;fill-opacity:1">
+      <path
+         d="m 408.06919,141 h 55.52816 l 79.46242,108.84518 h 34.79618 V 316.7609 L 516.29349,383.67662 463,383 l 0.22453,82 H 410 v -82 h 53 l 61.32337,-66.2391 v -66.91572 h -37.4728 z"
+         id="path1"
+         sodipodi:nodetypes="ccccccccccccccc"
+         style="fill:#82a300;fill-opacity:1" />
+    </g>
+    <g
+       id="dog"
+       fill="#cb3e23"
+       transform="matrix(0.14268946,0,0,0.14268946,62.840937,81.898426)"
+       style="fill:#da6725;fill-opacity:1">
+      <path
+         id="ear"
+         d="m 271,150 -134,128 111,86 20,-20 z"
+         style="fill:#da6725;fill-opacity:1" />
+      <path
+         id="head"
+         fill-rule="evenodd"
+         d="m 282,141 h 102 l 86,122 h 37 v 52 l -52,53 h -65 v 97 H 127 l 75,-116 50,40 30,-31 z m 134.5,109.5 a 21.5,21.5 0 1 0 -43,0 21.5,21.5 0 1 0 43,0 z"
+         style="fill:#da6725;fill-opacity:1" />
+    </g>
+  </g>
+</svg>
