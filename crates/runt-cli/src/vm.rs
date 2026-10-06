@@ -61,6 +61,7 @@ pub fn create(
             net,
             mounts,
             egress,
+            created_by: None,
         };
         state::save(&rec)?;
         Ok(rec)

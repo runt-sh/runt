@@ -545,6 +545,28 @@ fn mcp_server() {
     );
     assert_eq!(r["structuredContent"]["timed_out"], true);
 
+    // VMs a person created are off limits unless granted.
+    let theirs = Vm::new("mcp-theirs");
+    let r = call(
+        &mut rpc,
+        "vm_exec",
+        serde_json::json!({ "vm": theirs.0, "command": "true" }),
+    );
+    assert_eq!(r["isError"], true, "{r}");
+    let r = call(&mut rpc, "vm_remove", serde_json::json!({ "vm": theirs.0 }));
+    assert_eq!(r["isError"], true, "{r}");
+    let r = call(&mut rpc, "vm_list", serde_json::json!({}));
+    let names: Vec<_> = r["structuredContent"]["vms"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| v["name"].as_str().unwrap().to_string())
+        .collect();
+    assert!(
+        names.contains(&name) && !names.contains(&theirs.0),
+        "{names:?}"
+    );
+
     // Shares outside the server's directory are refused.
     let r = call(
         &mut rpc,

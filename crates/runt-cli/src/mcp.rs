@@ -7,7 +7,8 @@
 //!
 //! The operator decides what an agent may reach on this machine: shares are
 //! limited to `--mount-root` directories (default: the directory the server
-//! was started in), and LAN access needs `--allow-lan`.
+//! was started in), LAN access needs `--allow-lan`, and agents see only the
+//! VMs they created unless granted others (`--vm NAME`, `--all-vms`).
 
 use std::io::{self, BufRead, Write};
 use std::path::PathBuf;
@@ -39,10 +40,21 @@ pub struct Config {
     pub allow_lan: bool,
     /// Where relative mount sources resolve and exec's default workdir maps from.
     pub cwd: PathBuf,
+    /// Existing VMs agents may also use.
+    pub vms: Vec<String>,
+    pub all_vms: bool,
 }
 
+/// Marks VMs created through this server.
+const CREATOR: &str = "mcp";
+
 impl Config {
-    pub fn new(mount_roots: Vec<PathBuf>, allow_lan: bool) -> Result<Config> {
+    pub fn new(
+        mount_roots: Vec<PathBuf>,
+        allow_lan: bool,
+        vms: Vec<String>,
+        all_vms: bool,
+    ) -> Result<Config> {
         let cwd = std::env::current_dir()?;
         let roots = if mount_roots.is_empty() {
             vec![cwd.clone()]
@@ -64,7 +76,28 @@ impl Config {
             mount_roots,
             allow_lan,
             cwd,
+            vms,
+            all_vms,
         })
+    }
+
+    fn may_use(&self, rec: &state::VmRecord) -> bool {
+        self.all_vms || rec.created_by.as_deref() == Some(CREATOR) || self.vms.contains(&rec.name)
+    }
+
+    /// Load a VM the agent may use.
+    fn load(&self, name: &str) -> Result<state::VmRecord> {
+        let rec = state::load(name)?;
+        if !self.may_use(&rec) {
+            return Err(CliError::new(
+                "not_permitted",
+                format!("VM {name:?} was not created by an agent, so agents can't use it"),
+            )
+            .hint(format!(
+                "the user can allow it by starting `runt mcp --vm {name}`, or create a new VM with vm_create"
+            )));
+        }
+        Ok(rec)
     }
 }
 
@@ -217,11 +250,11 @@ fn call_tool(cfg: &Config, params: &Value) -> Value {
     let r = match name {
         "vm_create" => vm_create(cfg, args),
         "vm_exec" => vm_exec(cfg, args),
-        "vm_list" => vm_list(),
-        "vm_start" => vm_start(args),
-        "vm_stop" => vm_stop(args),
-        "vm_remove" => vm_remove(args),
-        "vm_logs" => vm_logs(args),
+        "vm_list" => vm_list(cfg),
+        "vm_start" => vm_start(cfg, args),
+        "vm_stop" => vm_stop(cfg, args),
+        "vm_remove" => vm_remove(cfg, args),
+        "vm_logs" => vm_logs(cfg, args),
         _ => Err(CliError::new(
             "unknown_tool",
             format!("unknown tool {name:?}"),
@@ -327,6 +360,7 @@ fn vm_create(cfg: &Config, args: &Map<String, Value>) -> ToolResult {
         net,
         egress,
         mounts,
+        created_by: Some(CREATOR.into()),
     })?;
     let mut text = format!("created VM {:?} (booted in {boot_ms} ms)", rec.name);
     for m in &rec.mounts {
@@ -367,8 +401,8 @@ fn share(cfg: &Config, spec: &str) -> Result<mounts::Mount> {
     Ok(m)
 }
 
-fn running(name: &str) -> Result<state::VmRecord> {
-    let rec = state::load(name)?;
+fn running(cfg: &Config, name: &str) -> Result<state::VmRecord> {
+    let rec = cfg.load(name)?;
     if state::status(&rec) != Status::Running {
         return Err(
             CliError::new("vm_not_running", format!("VM {name:?} is not running"))
@@ -381,7 +415,7 @@ fn running(name: &str) -> Result<state::VmRecord> {
 fn vm_exec(cfg: &Config, args: &Map<String, Value>) -> ToolResult {
     let name = required(args, "vm")?;
     let command = required(args, "command")?;
-    let rec = running(name)?;
+    let rec = running(cfg, name)?;
     let timeout = int_arg(args, "timeout")?.unwrap_or(DEFAULT_TIMEOUT_S);
     if !(1..=MAX_TIMEOUT_S).contains(&timeout) {
         return Err(bad_arg(format!(
@@ -447,8 +481,9 @@ fn vm_exec(cfg: &Config, args: &Map<String, Value>) -> ToolResult {
     ))
 }
 
-fn vm_list() -> ToolResult {
-    let vms = state::list()?;
+fn vm_list(cfg: &Config) -> ToolResult {
+    let mut vms = state::list()?;
+    vms.retain(|r| cfg.may_use(r));
     let items: Vec<Value> = vms.iter().map(ops::vm_json).collect();
     let text = if vms.is_empty() {
         "no VMs".to_string()
@@ -476,9 +511,9 @@ fn vm_list() -> ToolResult {
     Ok((text, json!({ "vms": items })))
 }
 
-fn vm_start(args: &Map<String, Value>) -> ToolResult {
+fn vm_start(cfg: &Config, args: &Map<String, Value>) -> ToolResult {
     let name = required(args, "vm")?;
-    let mut rec = state::load(name)?;
+    let mut rec = cfg.load(name)?;
     let ms = vm::start(&mut rec)?;
     Ok((
         format!("started {name:?} ({ms} ms)"),
@@ -486,9 +521,9 @@ fn vm_start(args: &Map<String, Value>) -> ToolResult {
     ))
 }
 
-fn vm_stop(args: &Map<String, Value>) -> ToolResult {
+fn vm_stop(cfg: &Config, args: &Map<String, Value>) -> ToolResult {
     let name = required(args, "vm")?;
-    let mut rec = state::load(name)?;
+    let mut rec = cfg.load(name)?;
     vm::stop(&mut rec, false)?;
     Ok((
         format!("stopped {name:?}"),
@@ -496,8 +531,9 @@ fn vm_stop(args: &Map<String, Value>) -> ToolResult {
     ))
 }
 
-fn vm_remove(args: &Map<String, Value>) -> ToolResult {
+fn vm_remove(cfg: &Config, args: &Map<String, Value>) -> ToolResult {
     let name = required(args, "vm")?;
+    cfg.load(name)?;
     vm::remove(name, true)?;
     Ok((
         format!("removed {name:?}"),
@@ -505,9 +541,9 @@ fn vm_remove(args: &Map<String, Value>) -> ToolResult {
     ))
 }
 
-fn vm_logs(args: &Map<String, Value>) -> ToolResult {
+fn vm_logs(cfg: &Config, args: &Map<String, Value>) -> ToolResult {
     let name = required(args, "vm")?;
-    state::load(name)?;
+    cfg.load(name)?;
     let (path, empty) = if bool_arg(args, "egress")? {
         (state::egress_log_path(name), "nothing refused")
     } else {
@@ -538,6 +574,8 @@ mod tests {
             mount_roots: vec![root.to_path_buf()],
             allow_lan: false,
             cwd: root.to_path_buf(),
+            vms: vec![],
+            all_vms: false,
         }
     }
 
@@ -570,6 +608,29 @@ mod tests {
         assert_eq!(e.code, "not_permitted");
         assert!(share(&c, "/tmp").is_err());
         std::fs::remove_dir_all(&base).unwrap();
+    }
+
+    #[test]
+    fn agents_only_use_their_own_vms_unless_granted() {
+        let rec = |name: &str, by: Option<&str>| state::VmRecord {
+            name: name.into(),
+            cpus: 1,
+            mem_mib: 512,
+            created: String::new(),
+            pid: None,
+            net: NetMode::Nat,
+            mounts: vec![],
+            egress: Egress::default(),
+            created_by: by.map(String::from),
+        };
+        let mut c = cfg(Path::new("/"));
+        assert!(c.may_use(&rec("a", Some(CREATOR))));
+        assert!(!c.may_use(&rec("mine", None)));
+        c.vms = vec!["mine".into()];
+        assert!(c.may_use(&rec("mine", None)));
+        assert!(!c.may_use(&rec("other", None)));
+        c.all_vms = true;
+        assert!(c.may_use(&rec("other", None)));
     }
 
     #[test]

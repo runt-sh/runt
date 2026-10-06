@@ -14,6 +14,7 @@ pub struct NewSpec {
     pub net: NetMode,
     pub egress: Egress,
     pub mounts: Vec<Mount>,
+    pub created_by: Option<String>,
 }
 
 /// Create and boot a VM; returns its record and boot time in ms. A VM that
@@ -28,6 +29,10 @@ pub fn new_vm(spec: NewSpec) -> Result<(VmRecord, u128)> {
         spec.egress,
         spec.mounts,
     )?;
+    if spec.created_by.is_some() {
+        rec.created_by = spec.created_by;
+        state::save(&rec)?;
+    }
     match vm::start(&mut rec) {
         Ok(ms) => Ok((rec, ms)),
         Err(e) => {
@@ -68,7 +73,8 @@ pub fn vm_json(r: &VmRecord) -> Value {
     };
     json!({
         "name": r.name, "status": status, "cpus": r.cpus,
-        "mem_mib": r.mem_mib, "created": r.created, "net": r.net,
+        "mem_mib": r.mem_mib, "created": r.created, "created_by": r.created_by,
+        "net": r.net,
         "mounts": r.mounts, "egress": egress_json(r),
         "sandbox": running.then(|| vm::SandboxStatus::read(&r.name)).flatten(),
         "ports": ports.iter()

@@ -78,7 +78,8 @@ enum Cmd {
         /// Set an environment variable (KEY=VALUE, or KEY to copy it from here)
         #[arg(short = 'e', long = "env", value_name = "KEY[=VALUE]")]
         env: Vec<String>,
-        /// Working directory inside the VM (default: /root)
+        /// Working directory inside the VM (default: the same path as here
+        /// when this directory is shared with the VM, else /root)
         #[arg(short = 'w', long = "workdir")]
         workdir: Option<String>,
         /// Command and arguments
@@ -128,6 +129,23 @@ enum Cmd {
         /// Let agents give VMs access to private networks (LAN, Tailscale)
         #[arg(long)]
         allow_lan: bool,
+        /// Also let agents use and remove this existing VM (repeatable).
+        /// By default they only see VMs they created.
+        #[arg(long = "vm", value_name = "NAME")]
+        vms: Vec<String>,
+        /// Let agents use and remove all of your VMs
+        #[arg(long, conflicts_with = "vms")]
+        all_vms: bool,
+    },
+    /// Print the runt skill for AI coding agents, or install it for Claude
+    /// Code (~/.claude/skills/runt/SKILL.md)
+    Skill {
+        /// Write it to DIR/runt/SKILL.md instead of printing it
+        #[arg(long)]
+        install: bool,
+        /// Skills directory for --install (default: ~/.claude/skills)
+        #[arg(long, value_name = "DIR", requires = "install")]
+        dir: Option<std::path::PathBuf>,
     },
     #[command(name = "__vmm", hide = true)]
     Vmm { name: String },
@@ -186,6 +204,7 @@ fn run(cli: Cli) -> Result<i32> {
                 net,
                 egress: state::Egress::new(&allow, allow_lan)?,
                 mounts,
+                created_by: None,
             })?;
             if json {
                 print_json(ops::created_json(&rec, boot_ms));
@@ -372,7 +391,42 @@ fn run(cli: Cli) -> Result<i32> {
         Cmd::Mcp {
             mount_roots,
             allow_lan,
-        } => mcp::serve(mcp::Config::new(mount_roots, allow_lan)?).map(|()| 0),
+            vms,
+            all_vms,
+        } => mcp::serve(mcp::Config::new(mount_roots, allow_lan, vms, all_vms)?).map(|()| 0),
+        Cmd::Skill { install: false, .. } => {
+            if json {
+                print_json(json!({ "skill": SKILL }));
+            } else {
+                print!("{SKILL}");
+            }
+            Ok(0)
+        }
+        Cmd::Skill { dir, .. } => {
+            let dir = match dir {
+                Some(d) => d,
+                None => std::path::PathBuf::from(std::env::var_os("HOME").ok_or_else(|| {
+                    CliError::new("no_home", "HOME is not set").hint("pass --dir")
+                })?)
+                .join(".claude/skills"),
+            };
+            let path = dir.join("runt/SKILL.md");
+            let status = match std::fs::read_to_string(&path) {
+                Ok(old) if old == SKILL => "unchanged",
+                Ok(_) => "updated",
+                Err(_) => "installed",
+            };
+            if status != "unchanged" {
+                std::fs::create_dir_all(dir.join("runt"))?;
+                std::fs::write(&path, SKILL)?;
+            }
+            if json {
+                print_json(json!({ "path": path, "status": status }));
+            } else {
+                eprintln!("{status} {}", path.display());
+            }
+            Ok(0)
+        }
         Cmd::Vmm { name } => vm::supervise(&name).map(|()| 0),
     }
 }
@@ -455,6 +509,9 @@ fn warn_if_unsandboxed(name: &str) {
         None => eprintln!("runt: warning: unknown sandbox status for the VM's host process"),
     }
 }
+
+/// The agent skill, shipped inside the binary so it matches this version.
+const SKILL: &str = include_str!("../../../skills/runt/SKILL.md");
 
 fn print_json(v: serde_json::Value) {
     println!("{v}");
