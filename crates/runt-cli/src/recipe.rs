@@ -22,6 +22,12 @@
 //! cmd = "python3 -m http.server 8000"
 //! cwd = "/app"
 //!
+//! [http]                    # served at http://myapp.runt.localhost
+//! port = 8000
+//!
+//! [volumes]                 # kept when the VM is recreated
+//! data = { path = "/data", size = "1G" }
+//!
 //! [network]
 //! allow = ["pypi.org", "files.pythonhosted.org"]
 //!
@@ -38,6 +44,7 @@ use toml::{Table, Value};
 use crate::error::{CliError, Result};
 use crate::mounts::{self, Mount};
 use crate::state::{self, Egress};
+use crate::volumes::{self, Volume};
 
 pub const FILE: &str = "runt.toml";
 /// The only base image so far.
@@ -64,6 +71,9 @@ pub struct Recipe {
     pub egress: Egress,
     /// `[dev] mounts`.
     pub mounts: Vec<Mount>,
+    pub volumes: Vec<Volume>,
+    /// `[http] port`.
+    pub http: Option<u16>,
 }
 
 /// One build step. Its JSON form is part of the step's cache key.
@@ -276,15 +286,15 @@ pub fn parse(text: &str, dir: &Path) -> Result<Recipe> {
     let doc: Table = text
         .parse()
         .map_err(|e: toml::de::Error| invalid(e.to_string().trim_end()))?;
-    for key in ["http", "volumes", "deploy"] {
-        if doc.contains_key(key) {
-            return Err(invalid(format!("[{key}] isn't supported yet")));
-        }
+    if doc.contains_key("deploy") {
+        return Err(invalid("[deploy] isn't supported yet"));
     }
     let top = Fields::new(
         &doc,
         "",
-        &["name", "vm", "build", "env", "services", "network", "dev"],
+        &[
+            "name", "vm", "build", "env", "services", "http", "volumes", "network", "dev",
+        ],
     )?;
     let name = top
         .str("name")?
@@ -399,6 +409,44 @@ pub fn parse(text: &str, dir: &Path) -> Result<Recipe> {
         .collect::<Result<Vec<_>>>()?;
     mounts::validate_set(&mounts)?;
 
+    let http = Fields::new(top.table("http")?.unwrap_or(&empty), "[http]", &["port"])?;
+    let http = match http.table.get("port") {
+        None => None,
+        Some(Value::Integer(n)) if (1..=65535).contains(n) => Some(*n as u16),
+        Some(_) => return Err(http.err("port", "must be a port number")),
+    };
+    let volumes = top
+        .table("volumes")?
+        .map(|t| {
+            t.iter()
+                .map(|(name, v)| volume(name, v))
+                .collect::<Result<Vec<_>>>()
+        })
+        .transpose()?
+        .unwrap_or_default();
+    if volumes.len() > volumes::MAX_VOLUMES {
+        return Err(invalid(format!(
+            "at most {} volumes are supported",
+            volumes::MAX_VOLUMES
+        )));
+    }
+    let mut dirs: Vec<(String, &Path)> = volumes
+        .iter()
+        .map(|v| (format!("volume {:?}", v.name), Path::new(&v.path)))
+        .collect();
+    dirs.extend(
+        mounts
+            .iter()
+            .map(|m| (format!("mount {}", m.dst.display()), m.dst.as_path())),
+    );
+    for (i, (a, pa)) in dirs.iter().enumerate() {
+        for (b, pb) in &dirs[i + 1..] {
+            if pa.starts_with(pb) || pb.starts_with(pa) {
+                return Err(invalid(format!("{a} and {b} overlap inside the VM")));
+            }
+        }
+    }
+
     Ok(Recipe {
         dir: dir.to_path_buf(),
         name,
@@ -410,7 +458,54 @@ pub fn parse(text: &str, dir: &Path) -> Result<Recipe> {
         services,
         egress,
         mounts,
+        volumes,
+        http,
     })
+}
+
+/// `NAME = { path = "/data", size = "1G" }`, or just `NAME = "/data"`.
+fn volume(name: &str, v: &Value) -> Result<Volume> {
+    let at = format!("[volumes] {name}");
+    if !valid_name(name) {
+        return Err(invalid(format!(
+            "volume name {name:?}: use 1-32 lowercase letters, digits, - and _"
+        )));
+    }
+    let (path, size) = match v {
+        Value::String(p) => (p.clone(), None),
+        Value::Table(t) => {
+            let f = Fields::new(t, at.clone(), &["path", "size"])?;
+            let path = f
+                .str("path")?
+                .ok_or_else(|| invalid(format!("{at} needs `path`, where it is mounted")))?;
+            (path, f.str("size")?)
+        }
+        _ => {
+            return Err(invalid(format!(
+                "{at} must be like {{ path = \"/data\", size = \"1G\" }}"
+            )));
+        }
+    };
+    let path = absolute_path(&path, "path").map_err(|e| invalid(format!("{at}: {e}")))?;
+    volumes::validate_path(&path).map_err(|e| invalid(format!("{at}: {e}")))?;
+    let size_mib = match size {
+        Some(s) => volumes::parse_size(&s).map_err(|e| invalid(format!("{at} size: {e}")))?,
+        None => volumes::DEFAULT_SIZE_MIB,
+    };
+    Ok(Volume {
+        name: name.into(),
+        path,
+        size_mib,
+    })
+}
+
+/// Service and volume names.
+fn valid_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= 32
+        && name
+            .chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-' || c == '_')
 }
 
 fn step(f: &Fields) -> Result<Step> {
@@ -497,12 +592,7 @@ const SERVICE_KEYS: &[&str] = &["cmd", "cwd", "env", "restart"];
 /// A service from `[services.NAME]`, with `[dev.services.NAME]` on top
 /// (either may be missing, not both).
 fn service(name: &str, base: Option<&Table>, dev: Option<&Table>) -> Result<ServiceDef> {
-    let ok = !name.is_empty()
-        && name.len() <= 32
-        && name
-            .chars()
-            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-' || c == '_');
-    if !ok {
+    if !valid_name(name) {
         return Err(invalid(format!(
             "service name {name:?}: use 1-32 lowercase letters, digits, - and _"
         )));
@@ -653,9 +743,28 @@ mod tests {
                 "name = \"x\"\n[build]\nsteps = [{ run = \"x\", cdw = \"/\" }]",
                 "build step 1 `cdw`",
             ),
+            ("name = \"x\"\n[deploy]\n", "[deploy] isn't supported yet"),
+            ("name = \"x\"\n[http]\nport = 0", "[http] `port`"),
+            ("name = \"x\"\n[http]\nprot = 1", "[http] `prot`"),
+            ("name = \"x\"\n[volumes]\nd = \"rel\"", "absolute"),
+            ("name = \"x\"\n[volumes]\nd = \"/etc\"", "system"),
+            ("name = \"x\"\n[volumes]\nd = \"/proc/x\"", "system"),
+            ("name = \"x\"\n[volumes]\nD = \"/d\"", "volume name"),
             (
-                "name = \"x\"\n[http]\nport = 3000",
-                "[http] isn't supported yet",
+                "name = \"x\"\n[volumes]\nd = { size = \"1G\" }",
+                "needs `path`",
+            ),
+            (
+                "name = \"x\"\n[volumes]\nd = { path = \"/d\", size = \"1\" }",
+                "unit",
+            ),
+            (
+                "name = \"x\"\n[volumes]\na = \"/d\"\nb = \"/d/e\"",
+                "overlap",
+            ),
+            (
+                "name = \"x\"\n[volumes]\na = \"/app/data\"\n[dev]\nmounts = [\".:/app\"]",
+                "overlap",
             ),
             ("name = \"x\"\n[build]\nbase = \"debian\"", "only base"),
             (
@@ -708,6 +817,29 @@ mod tests {
             vec!["{ run = \"true\" }"; MAX_STEPS + 1].join(",")
         );
         assert!(parse_err(&many).contains("at most"));
+    }
+
+    #[test]
+    fn volumes_and_http() {
+        let r = parse_ok(
+            "name = \"x\"\n[http]\nport = 3000\n[volumes]\ndb = { path = \"/var/lib//db/\", size = \"10G\" }\ncache = \"/cache\"",
+        );
+        assert_eq!(r.http, Some(3000));
+        assert_eq!(
+            r.volumes,
+            vec![
+                Volume {
+                    name: "cache".into(),
+                    path: "/cache".into(),
+                    size_mib: 1024
+                },
+                Volume {
+                    name: "db".into(),
+                    path: "/var/lib/db".into(),
+                    size_mib: 10240
+                },
+            ]
+        );
     }
 
     #[test]

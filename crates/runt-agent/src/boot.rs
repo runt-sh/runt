@@ -1,9 +1,10 @@
 //! Early boot: everything PID 1 does before serving requests.
 //!
 //! The kernel starts us from the initramfs. We mount the read-only base image
-//! (vda, erofs), any image layers built from a recipe (vdc, vdd, ..., erofs)
-//! and the per-VM writable disk (vdb, ext4), combine them with overlayfs, and
-//! switch into the result. We stay PID 1 the whole time; the
+//! (vda, erofs), any image layers built from a recipe (erofs files on the
+//! read-only `layers` share) and the per-VM writable disk (vdb, ext4),
+//! combine them with overlayfs, and switch into the result. Then come the
+//! recipe's volumes (ext4 disks vdc, vdd, ...) and shared folders. We stay PID 1 the whole time; the
 //! agent binary is already in memory.
 
 use std::ffi::CString;
@@ -19,6 +20,7 @@ use crate::sys::{self, cvt};
 const LOWER: &str = "/mnt/lower";
 const UPPER: &str = "/mnt/upper";
 const ROOT: &str = "/mnt/root";
+const LAYERS: &str = "/mnt/layers";
 
 /// Settings passed on the kernel command line as `runt.<key>=<value>`.
 #[derive(Debug, Default)]
@@ -28,12 +30,17 @@ pub struct Cmdline {
     pub net: Option<NetConfig>,
     /// Shared folders to mount.
     pub mounts: Vec<GuestMount>,
-    /// Image layers on top of the base, as disks after the writable one.
+    /// Image layers on top of the base: files 0.erofs, 1.erofs, ... on the
+    /// `layers` share.
     pub layers: usize,
+    /// Where to mount each volume, as disks after the writable one.
+    pub volumes: Vec<String>,
 }
 
 /// More than this many layers would not fit in overlayfs' mount options.
 pub const MAX_LAYERS: usize = 24;
+/// Disks are named vda..vdz.
+const MAX_DISKS: usize = 26;
 
 impl Cmdline {
     fn parse(s: &str) -> Cmdline {
@@ -54,6 +61,15 @@ impl Cmdline {
                 .and_then(|n| n.parse().ok())
                 .filter(|n| *n <= MAX_LAYERS)
                 .unwrap_or(0),
+            volumes: get("runt.vols=")
+                .map(|v| {
+                    let (paths, errors) = crate::mounts::parse_paths(v);
+                    for e in errors {
+                        eprintln!("runt-agent: warning: {e}");
+                    }
+                    paths
+                })
+                .unwrap_or_default(),
         }
     }
 }
@@ -87,10 +103,20 @@ pub fn early() -> io::Result<Cmdline> {
     mount("/dev/vda", LOWER, "erofs", libc::MS_RDONLY, "")?;
     // overlayfs lists lower layers top first.
     let mut lowers = vec![LOWER.to_string()];
+    if cmdline.layers > 0 {
+        mkdir_p(LAYERS)?;
+        mount("layers", LAYERS, "virtiofs", libc::MS_RDONLY, "")?;
+    }
     for i in 0..cmdline.layers {
         let dir = format!("/mnt/layer{i}");
         mkdir_p(&dir)?;
-        mount(&disk(i + 2), &dir, "erofs", libc::MS_RDONLY, "")?;
+        mount(
+            &format!("{LAYERS}/{i}.erofs"),
+            &dir,
+            "erofs",
+            libc::MS_RDONLY,
+            "",
+        )?;
         lowers.insert(0, dir);
     }
     mount("/dev/vdb", UPPER, "ext4", libc::MS_NOATIME, "")?;
@@ -124,6 +150,11 @@ pub fn early() -> io::Result<Cmdline> {
     std::env::set_current_dir("/")?;
 
     late_mounts()?;
+    for (i, path) in cmdline.volumes.iter().enumerate() {
+        if 2 + i < MAX_DISKS {
+            crate::mounts::mount_volume(&disk(2 + i), path);
+        }
+    }
     crate::mounts::mount_all(&cmdline.mounts);
     if let Some(name) = &cmdline.name {
         // SAFETY: pointer/len describe a valid buffer.
@@ -243,6 +274,8 @@ mod tests {
         assert_eq!(Cmdline::parse("runt.layers=3").layers, 3);
         assert_eq!(Cmdline::parse("runt.layers=999").layers, 0);
         assert_eq!(Cmdline::parse("").layers, 0);
+        let c = Cmdline::parse("runt.layers=2 runt.vols=2f64617461,2f7661722f6c6962");
+        assert_eq!(c.volumes, vec!["/data", "/var/lib"]);
     }
 
     #[test]

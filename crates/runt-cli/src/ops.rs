@@ -9,7 +9,7 @@ use crate::error::Result;
 use crate::mounts::Mount;
 use crate::recipe::ServiceDef;
 use crate::state::{self, Egress, NetMode, Status, VmRecord};
-use crate::{names, ports, vm};
+use crate::{names, ports, router, vm};
 
 #[derive(Default)]
 pub struct NewSpec {
@@ -22,9 +22,10 @@ pub struct NewSpec {
     pub created_by: Option<String>,
     pub project: Option<PathBuf>,
     pub layers: Vec<String>,
-    pub disks: Vec<PathBuf>,
     pub env: BTreeMap<String, String>,
     pub services: Vec<ServiceDef>,
+    pub volumes: Vec<crate::volumes::Volume>,
+    pub http: Option<u16>,
 }
 
 /// Create and boot a VM; returns its record and boot time in ms. A VM that
@@ -42,9 +43,10 @@ pub fn new_vm(spec: NewSpec) -> Result<(VmRecord, u128)> {
     rec.created_by = spec.created_by;
     rec.project = spec.project;
     rec.layers = spec.layers;
-    rec.disks = spec.disks;
     rec.env = spec.env;
     rec.services = spec.services;
+    rec.volumes = spec.volumes;
+    rec.http = spec.http;
     state::save(&rec)?;
     match vm::start(&mut rec) {
         Ok(ms) => Ok((rec, ms)),
@@ -101,7 +103,8 @@ pub fn vm_json(r: &VmRecord) -> Value {
         "name": r.name, "status": status, "cpus": r.cpus,
         "mem_mib": r.mem_mib, "created": r.created, "created_by": r.created_by,
         "project": r.project, "net": r.net,
-        "mounts": r.mounts, "egress": egress_json(r),
+        "mounts": r.mounts, "volumes": r.volumes, "egress": egress_json(r),
+        "http_port": r.http, "url": running.then(|| router::url(r)).flatten(),
         "services": services.map(|s| services_json(&s))
             .unwrap_or_else(|| json!(r.services.iter().map(|s| json!({"name": s.name})).collect::<Vec<_>>())),
         "sandbox": running.then(|| vm::SandboxStatus::read(&r.name)).flatten(),

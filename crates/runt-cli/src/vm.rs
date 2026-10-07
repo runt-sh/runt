@@ -15,6 +15,7 @@ use crate::error::{CliError, Result};
 use crate::mounts::{self, Mount};
 use crate::ports;
 use crate::state::{self, Egress, NetMode, Status, VmRecord};
+use crate::{router, volumes};
 
 /// Size of the sparse per-VM disk. Only written blocks use host space.
 const UPPER_DISK_BYTES: u64 = 20 * 1024 * 1024 * 1024;
@@ -51,7 +52,7 @@ pub fn create(
     }
     fs::create_dir_all(&dir)?;
     let result = (|| {
-        make_upper_disk(&dir.join("upper.ext4"))?;
+        make_ext4(&dir.join("upper.ext4"), UPPER_DISK_BYTES)?;
         let rec = VmRecord {
             name: name.into(),
             cpus,
@@ -72,23 +73,11 @@ pub fn create(
     result
 }
 
-fn make_upper_disk(path: &Path) -> Result<()> {
-    File::create(path)?.set_len(UPPER_DISK_BYTES)?;
-    // L0 uses the host's mkfs.ext4; formatting in-process is a TODO.
-    let mkfs = ["mkfs.ext4", "/usr/sbin/mkfs.ext4", "/sbin/mkfs.ext4"]
-        .into_iter()
-        .find(|p| {
-            Command::new(p)
-                .arg("-V")
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .status()
-                .is_ok()
-        })
-        .ok_or_else(|| {
-            CliError::new("mkfs_missing", "mkfs.ext4 not found").hint("install e2fsprogs")
-        })?;
-    let st = Command::new(mkfs)
+/// Create a sparse file of `bytes` holding an empty ext4 filesystem.
+pub fn make_ext4(path: &Path, bytes: u64) -> Result<()> {
+    File::create(path)?.set_len(bytes)?;
+    // Formatting uses the host's e2fsprogs; doing it in-process is a TODO.
+    let st = Command::new(tool("mkfs.ext4")?)
         .args([
             "-q",
             "-F",
@@ -99,12 +88,34 @@ fn make_upper_disk(path: &Path) -> Result<()> {
         .stdout(Stdio::null())
         .status()?;
     if !st.success() {
+        let _ = fs::remove_file(path);
         return Err(CliError::new(
             "mkfs_failed",
             format!("mkfs.ext4 failed on {}", path.display()),
         ));
     }
     Ok(())
+}
+
+/// An e2fsprogs program, which may live outside a user's PATH in sbin.
+pub fn tool(name: &str) -> Result<PathBuf> {
+    [
+        PathBuf::from(name),
+        Path::new("/usr/sbin").join(name),
+        Path::new("/sbin").join(name),
+    ]
+    .into_iter()
+    .find(|p| {
+        Command::new(p)
+            .arg("-V")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .is_ok()
+    })
+    .ok_or_else(|| {
+        CliError::new("mkfs_missing", format!("{name} not found")).hint("install e2fsprogs")
+    })
 }
 
 /// Boot a stopped VM. Returns the time until the agent answered, in ms.
@@ -116,7 +127,9 @@ pub fn start(rec: &mut VmRecord) -> Result<u128> {
         ));
     }
     runt_vmm::probe().map_err(|e| CliError::new("libkrun_missing", e.to_string()))?;
-    if let Some(missing) = extra_disks(rec).into_iter().find(|p| !p.is_file()) {
+    check_devices(rec)?;
+    let layers = rec.layers.iter().map(|k| state::layer_path(k));
+    if let Some(missing) = layers.clone().find(|p| !p.is_file()) {
         let hint = match &rec.project {
             Some(dir) => format!("rebuild it with `runt up` in {}", dir.display()),
             None => format!("remove it with `runt rm {}`", rec.name),
@@ -130,6 +143,27 @@ pub fn start(rec: &mut VmRecord) -> Result<u128> {
             ),
         )
         .hint(hint));
+    }
+    if let Some(v) = rec
+        .volumes
+        .iter()
+        .find(|v| !volumes::file(&rec.name, &v.name).is_file())
+    {
+        let hint = match &rec.project {
+            Some(dir) => format!("`runt up` in {} creates it again, empty", dir.display()),
+            None => format!("remove the VM with `runt rm {}`", rec.name),
+        };
+        return Err(CliError::new(
+            "volume_missing",
+            format!(
+                "VM {:?} needs its volume {:?}, which is gone",
+                rec.name, v.name
+            ),
+        )
+        .hint(hint));
+    }
+    if !rec.layers.is_empty() {
+        link_layers(&state::vm_layers_dir(&rec.name), layers)?;
     }
     let dir = state::vm_dir(&rec.name);
     let sock = state::socket_path(&rec.name);
@@ -180,6 +214,9 @@ pub fn start(rec: &mut VmRecord) -> Result<u128> {
             let ms = t0.elapsed().as_millis();
             if !rec.services.is_empty() {
                 client::set_services(rec)?;
+            }
+            if rec.http.is_some() {
+                router::ensure();
             }
             Ok(ms)
         }
@@ -266,6 +303,10 @@ pub fn supervise(name: &str) -> Result<()> {
     if !rec.layers.is_empty() {
         cmdline.push_str(&format!(" runt.layers={}", rec.layers.len()));
     }
+    if !rec.volumes.is_empty() {
+        let paths: Vec<String> = rec.volumes.iter().map(|v| mounts::hex(&v.path)).collect();
+        cmdline.push_str(&format!(" runt.vols={}", paths.join(",")));
+    }
     mounts::check_cmdline_len(&cmdline)?;
     let mut disks = vec![
         runt_vmm::Disk {
@@ -279,11 +320,11 @@ pub fn supervise(name: &str) -> Result<()> {
             read_only: false,
         },
     ];
-    for (i, path) in extra_disks(&rec).into_iter().enumerate() {
+    for (i, v) in rec.volumes.iter().enumerate() {
         disks.push(runt_vmm::Disk {
-            id: format!("ro{i}"),
-            path,
-            read_only: true,
+            id: format!("vol{i}"),
+            path: volumes::file(name, &v.name),
+            read_only: false,
         });
     }
     ports::start(name)
@@ -322,6 +363,11 @@ pub fn supervise(name: &str) -> Result<()> {
                 path: m.src.clone(),
                 read_only: m.read_only,
             })
+            .chain((!rec.layers.is_empty()).then(|| runt_vmm::Share {
+                tag: LAYERS_TAG.into(),
+                path: state::vm_layers_dir(name),
+                read_only: true,
+            }))
             .collect(),
         net: net.as_ref().map(|n| runt_vmm::NetDevice {
             fd: n.vmm_fd,
@@ -360,34 +406,89 @@ fn confine(rec: &VmRecord, assets: &state::Assets, dir: &Path) {
     );
 }
 
-/// Read-only disks after the base and the VM's own: its image layers
-/// (vdc, vdd, ...), then any others.
-fn extra_disks(rec: &VmRecord) -> Vec<PathBuf> {
-    rec.layers
-        .iter()
-        .map(|k| state::layer_path(k))
-        .chain(rec.disks.iter().cloned())
-        .collect()
+/// The virtio-fs tag of the share holding a VM's image layers.
+const LAYERS_TAG: &str = "layers";
+
+/// Make `dir` hold exactly `files`, as `0.erofs`, `1.erofs`, ...: hard links
+/// where possible (no copying, and a layer garbage-collected meanwhile stays
+/// readable), copies otherwise. The guest mounts them in that order.
+pub fn link_layers(dir: &Path, files: impl Iterator<Item = PathBuf>) -> Result<()> {
+    let _ = fs::remove_dir_all(dir);
+    fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(dir)?;
+    for (i, src) in files.enumerate() {
+        let dst = dir.join(format!("{i}.erofs"));
+        if fs::hard_link(&src, &dst).is_err() {
+            fs::copy(&src, &dst)?;
+        }
+    }
+    Ok(())
+}
+
+/// Refuse a VM with more disks and shares than the VMM can attach.
+pub fn check_devices(rec: &VmRecord) -> Result<()> {
+    let layers = usize::from(!rec.layers.is_empty());
+    let net = usize::from(rec.net == NetMode::Nat);
+    let used = 2 + layers + rec.volumes.len() + rec.mounts.len() + net;
+    if used <= runt_vmm::DEVICE_SLOTS {
+        return Ok(());
+    }
+    let room = runt_vmm::DEVICE_SLOTS - 2 - layers - net;
+    let what = if rec.volumes.is_empty() {
+        format!("{} shared folders", rec.mounts.len())
+    } else {
+        format!(
+            "{} volumes and {} shared folders",
+            rec.volumes.len(),
+            rec.mounts.len()
+        )
+    };
+    let with_image = if layers > 0 {
+        " with a built image"
+    } else {
+        ""
+    };
+    Err(CliError::new(
+        "too_many_devices",
+        format!(
+            "VM {:?} needs {what}; a VM{with_image} here can have {room} in total",
+            rec.name
+        ),
+    )
+    .hint(if rec.volumes.is_empty() {
+        "share a common parent folder instead of several"
+    } else {
+        "share a common parent folder instead of several, or combine volumes"
+    }))
 }
 
 /// Everything a VM's process may touch: its own state and runtime dirs, its
-/// kernel, image and layers, /dev/kvm, and the folders the user shared.
+/// kernel, image and layers, its volumes, /dev/kvm, and the folders the
+/// user shared.
 pub fn sandbox_policy(rec: &VmRecord, assets: &state::Assets, dir: &Path) -> runt_sandbox::Policy {
     let (rw_shares, ro_shares): (Vec<&Mount>, Vec<&Mount>) =
         rec.mounts.iter().partition(|m| !m.read_only);
     let mut rw_dirs = vec![dir.to_path_buf(), state::vm_runtime_dir(&rec.name)];
     rw_dirs.extend(rw_shares.iter().map(|m| m.src.clone()));
     runt_sandbox::Policy {
-        read_files: [
+        read_files: vec![
             assets.kernel.clone(),
             assets.initramfs.clone(),
             assets.image.clone(),
-        ]
-        .into_iter()
-        .chain(extra_disks(rec))
-        .collect(),
+        ],
+        rw_files: rec
+            .volumes
+            .iter()
+            .map(|v| volumes::file(&rec.name, &v.name))
+            .collect(),
         rw_dirs,
-        ro_dirs: ro_shares.iter().map(|m| m.src.clone()).collect(),
+        ro_dirs: ro_shares
+            .iter()
+            .map(|m| m.src.clone())
+            .chain((!rec.layers.is_empty()).then(|| state::vm_layers_dir(&rec.name)))
+            .collect(),
         devices: vec![PathBuf::from("/dev/kvm")],
     }
 }
@@ -433,6 +534,7 @@ pub fn stop(rec: &mut VmRecord, force: bool) -> Result<()> {
         }
     }
     let _ = fs::remove_dir_all(state::vm_runtime_dir(&rec.name));
+    let _ = fs::remove_dir_all(state::vm_layers_dir(&rec.name));
     rec.pid = None;
     state::save(rec)?;
     Ok(())
@@ -448,10 +550,13 @@ pub fn remove(name: &str, force: bool) -> Result<()> {
                 )),
             );
         }
-        stop(&mut rec, true)?;
+        // Killing the VM would lose writes its volumes haven't flushed.
+        let force = rec.volumes.is_empty();
+        stop(&mut rec, force)?;
     }
     fs::remove_dir_all(state::vm_dir(name))?;
     let _ = fs::remove_dir_all(state::vm_runtime_dir(name));
+    let _ = fs::remove_dir_all(state::vm_layers_dir(name));
     Ok(())
 }
 

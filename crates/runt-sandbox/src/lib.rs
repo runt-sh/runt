@@ -38,6 +38,8 @@ const ABI_TARGET: ABI = ABI::V9;
 pub struct Policy {
     /// Individual files readable (kernel, initramfs, base image).
     pub read_files: Vec<PathBuf>,
+    /// Individual files readable and writable (volume disks).
+    pub rw_files: Vec<PathBuf>,
     /// Directories with full read/write access beneath them (no exec).
     pub rw_dirs: Vec<PathBuf>,
     /// Directories readable beneath them.
@@ -95,6 +97,10 @@ fn landlock(p: &Policy) -> Result<Enforcement, landlock::RulesetError> {
         .scope(Scope::from_all(ABI_TARGET))?
         .create()?
         .add_rules(path_beneath_rules(&p.read_files, AccessFs::ReadFile))?
+        .add_rules(path_beneath_rules(
+            &p.rw_files,
+            AccessFs::ReadFile | AccessFs::WriteFile,
+        ))?
         .add_rules(path_beneath_rules(&p.ro_dirs, ro))?
         .add_rules(path_beneath_rules(&p.rw_dirs, rw))?
         .add_rules(path_beneath_rules(&p.devices, device))?

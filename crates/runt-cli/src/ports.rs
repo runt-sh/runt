@@ -151,18 +151,34 @@ fn accept_loop(listener: TcpListener, vm: String, sock: PathBuf, guest: u16) {
 
 /// Splice one host connection to guest loopback:port through the agent.
 fn forward(tcp: TcpStream, sock: &std::path::Path, guest: u16) -> Result<(), String> {
+    splice(tcp, open(sock, guest)?, &[]);
+    Ok(())
+}
+
+/// Connect to guest loopback:port through the VM's agent.
+pub fn open(sock: &std::path::Path, guest: u16) -> Result<client::Conn, String> {
     let conn = client::try_connect(sock, Duration::from_secs(5)).ok_or("agent unreachable")?;
     conn.mux
         .send(&Msg::Connect { port: guest })
         .map_err(|e| e.to_string())?;
     match conn.rx.recv() {
-        Ok(Event::Msg(Msg::Connected)) => {}
-        Ok(Event::Msg(Msg::Error { message })) => return Err(message),
-        _ => return Err("connection closed".into()),
+        Ok(Event::Msg(Msg::Connected)) => Ok(conn),
+        Ok(Event::Msg(Msg::Error { message })) => Err(message),
+        _ => Err("connection closed".into()),
     }
+}
+
+/// Copy bytes both ways between a host connection and a guest one until
+/// both sides are done. `first` goes to the guest before anything else.
+pub fn splice(tcp: TcpStream, conn: client::Conn, first: &[u8]) {
     let _ = tcp.set_nodelay(true);
-    let mut from_host = tcp.try_clone().map_err(|e| e.to_string())?;
+    let Ok(mut from_host) = tcp.try_clone() else {
+        return;
+    };
     let out = conn.mux.clone();
+    if !first.is_empty() && out.send_data(STDIN, first).is_err() {
+        return;
+    }
     thread::spawn(move || {
         let mut buf = vec![0u8; runt_proto::MAX_CHUNK];
         loop {
@@ -194,7 +210,6 @@ fn forward(tcp: TcpStream, sock: &std::path::Path, guest: u16) -> Result<(), Str
         }
     }
     let _ = to_host.shutdown(Shutdown::Both);
-    Ok(())
 }
 
 #[cfg(test)]

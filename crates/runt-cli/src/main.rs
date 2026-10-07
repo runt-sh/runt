@@ -10,10 +10,12 @@ mod ops;
 mod ports;
 mod project;
 mod recipe;
+mod router;
 mod state;
 mod tar;
 mod term;
 mod vm;
+mod volumes;
 
 use std::io::Write;
 use std::process::ExitCode;
@@ -68,6 +70,9 @@ enum Cmd {
         /// path as on the host. Repeatable.
         #[arg(short = 'm', long = "mount", value_name = "SRC[:DST][:ro]")]
         mounts: Vec<String>,
+        /// Serve this guest port at http://NAME.runt.localhost
+        #[arg(long, value_name = "PORT")]
+        http: Option<u16>,
     },
     /// Run a command in a VM
     #[command(trailing_var_arg = true)]
@@ -133,10 +138,16 @@ enum Cmd {
     Up,
     /// Stop the project's VM (its disk is kept)
     Down {
-        /// Remove the VM and its disk instead
+        /// Remove the VM and its disk instead (volumes are kept)
         #[arg(long)]
         rm: bool,
+        /// With --rm: delete the project's volumes, and their data, too
+        #[arg(long, requires = "rm")]
+        volumes: bool,
     },
+    /// List or delete volumes (persistent data from runt.toml's [volumes])
+    #[command(subcommand, alias = "volumes")]
+    Volume(VolumeCmd),
     /// List ports forwarded from a VM to this machine (automatic: any port
     /// the guest listens on appears on 127.0.0.1)
     #[command(alias = "ports")]
@@ -171,6 +182,8 @@ enum Cmd {
     },
     #[command(name = "__vmm", hide = true)]
     Vmm { name: String },
+    #[command(name = "__router", hide = true)]
+    Router,
     /// Apply a VM's sandbox to this process and try things it should and
     /// shouldn't be able to do (for tests).
     #[command(name = "__sandbox-check", hide = true)]
@@ -183,6 +196,16 @@ enum Cmd {
         #[arg(long)]
         connect: Vec<std::path::PathBuf>,
     },
+}
+
+#[derive(Subcommand)]
+enum VolumeCmd {
+    /// List volumes
+    #[command(alias = "list")]
+    Ls,
+    /// Delete a VM's volume and its data, or all of the VM's volumes
+    #[command(alias = "remove")]
+    Rm { vm: String, name: Option<String> },
 }
 
 fn main() -> ExitCode {
@@ -208,6 +231,7 @@ fn run(cli: Cli) -> Result<i32> {
             allow,
             allow_lan,
             mounts,
+            http,
         } => {
             let cwd = std::env::current_dir()?;
             let mounts = mounts
@@ -227,6 +251,7 @@ fn run(cli: Cli) -> Result<i32> {
                 egress: state::Egress::new(&allow, allow_lan)?,
                 mounts,
                 created_by: None,
+                http,
                 ..Default::default()
             })?;
             if json {
@@ -239,6 +264,9 @@ fn run(cli: Cli) -> Result<i32> {
                 }
                 if let Some(e) = ops::egress_summary(&rec) {
                     eprintln!("network: {e}");
+                }
+                if let Some(url) = router::url(&rec) {
+                    eprintln!("url: {url} (port {} in the VM)", http.unwrap_or(0));
                 }
                 eprintln!("booted in {boot_ms} ms; try `runt shell {}`", rec.name);
                 warn_if_unsandboxed(&rec.name);
@@ -316,6 +344,66 @@ fn run(cli: Cli) -> Result<i32> {
             vm::remove(&name, force)?;
             if json {
                 print_json(json!({ "name": name, "status": "removed" }));
+            } else if volumes::list().iter().any(|v| v.vm == name) {
+                eprintln!(
+                    "kept its volumes; delete them with `runt volume rm {name}` (or use `runt down --rm --volumes`)"
+                );
+            }
+            Ok(0)
+        }
+        Cmd::Volume(VolumeCmd::Ls) => {
+            let vols = volumes::list();
+            let records = state::list()?;
+            let path = |vm: &str, name: &str| {
+                records
+                    .iter()
+                    .find(|r| r.name == vm)
+                    .and_then(|r| r.volumes.iter().find(|v| v.name == name))
+                    .map(|v| v.path.clone())
+            };
+            if json {
+                let items: Vec<_> = vols
+                    .iter()
+                    .map(|v| {
+                        json!({
+                            "vm": v.vm, "name": v.name, "path": path(&v.vm, &v.name),
+                            "size_mib": v.size >> 20, "used_bytes": v.used,
+                            "project": volumes::owner(&v.vm),
+                        })
+                    })
+                    .collect();
+                print_json(json!(items));
+            } else if vols.is_empty() {
+                eprintln!("no volumes; declare them in runt.toml under [volumes]");
+            } else {
+                println!(
+                    "{:<24} {:<16} {:>6} {:>8}  PATH",
+                    "VM", "NAME", "SIZE", "USED"
+                );
+                for v in &vols {
+                    println!(
+                        "{:<24} {:<16} {:>6} {:>7}M  {}",
+                        v.vm,
+                        v.name,
+                        volumes::format_size(v.size >> 20),
+                        v.used.div_ceil(1 << 20),
+                        path(&v.vm, &v.name).unwrap_or_else(|| "-".into())
+                    );
+                }
+            }
+            Ok(0)
+        }
+        Cmd::Volume(VolumeCmd::Rm {
+            vm: name,
+            name: vol,
+        }) => {
+            let gone = volumes::remove(&name, vol.as_deref())?;
+            if json {
+                print_json(json!({ "vm": name, "removed": gone }));
+            } else if gone.is_empty() {
+                eprintln!("{name} has no volumes");
+            } else {
+                eprintln!("deleted {}", gone.join(", "));
             }
             Ok(0)
         }
@@ -373,6 +461,7 @@ fn run(cli: Cli) -> Result<i32> {
                     "build": { "layers": up.built.layers, "cached": up.built.cached,
                                "ms": up.built.ms, "log": up.built.log },
                     "services": ops::services_json(&up.services),
+                    "url": router::url(&up.rec), "volumes": up.rec.volumes,
                     "ports": maps.iter()
                         .map(|m| json!({ "guest": m.guest, "host": m.host, "url": m.url() }))
                         .collect::<Vec<_>>(),
@@ -392,8 +481,19 @@ fn run(cli: Cli) -> Result<i32> {
                 for s in &up.services {
                     eprintln!("  service {}", project::describe(s));
                 }
+                for v in &up.rec.volumes {
+                    eprintln!(
+                        "  volume {} at {} ({})",
+                        v.name,
+                        v.path,
+                        volumes::format_size(v.size_mib)
+                    );
+                }
                 for m in &maps {
                     eprintln!("  {} -> port {} in the VM", m.url(), m.guest);
+                }
+                if let Some(url) = router::url(&up.rec) {
+                    eprintln!("url: {url}");
                 }
                 if let Some(s) = up.services.first() {
                     eprintln!("logs: runt logs {name} -s {}", s.name);
@@ -401,9 +501,9 @@ fn run(cli: Cli) -> Result<i32> {
             }
             Ok(0)
         }
-        Cmd::Down { rm } => {
+        Cmd::Down { rm, volumes } => {
             let r = recipe::load(&recipe::find(&std::env::current_dir()?)?)?;
-            let existed = project::down(&r, rm)?;
+            let existed = project::down(&r, rm, volumes)?;
             let status = match (existed, rm) {
                 (false, _) => "absent",
                 (true, true) => "removed",
@@ -524,6 +624,7 @@ fn run(cli: Cli) -> Result<i32> {
             Ok(0)
         }
         Cmd::Vmm { name } => vm::supervise(&name).map(|()| 0),
+        Cmd::Router => router::serve().map(|()| 0),
     }
 }
 
