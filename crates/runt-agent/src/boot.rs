@@ -1,8 +1,9 @@
 //! Early boot: everything PID 1 does before serving requests.
 //!
 //! The kernel starts us from the initramfs. We mount the read-only base image
-//! (vda, erofs) and the per-VM writable disk (vdb, ext4), combine them with
-//! overlayfs, and switch into the result. We stay PID 1 the whole time; the
+//! (vda, erofs), any image layers built from a recipe (vdc, vdd, ..., erofs)
+//! and the per-VM writable disk (vdb, ext4), combine them with overlayfs, and
+//! switch into the result. We stay PID 1 the whole time; the
 //! agent binary is already in memory.
 
 use std::ffi::CString;
@@ -27,7 +28,12 @@ pub struct Cmdline {
     pub net: Option<NetConfig>,
     /// Shared folders to mount.
     pub mounts: Vec<GuestMount>,
+    /// Image layers on top of the base, as disks after the writable one.
+    pub layers: usize,
 }
+
+/// More than this many layers would not fit in overlayfs' mount options.
+pub const MAX_LAYERS: usize = 24;
 
 impl Cmdline {
     fn parse(s: &str) -> Cmdline {
@@ -44,8 +50,17 @@ impl Cmdline {
                     mounts
                 })
                 .unwrap_or_default(),
+            layers: get("runt.layers=")
+                .and_then(|n| n.parse().ok())
+                .filter(|n| *n <= MAX_LAYERS)
+                .unwrap_or(0),
         }
     }
+}
+
+/// Block device name of the `i`th disk (0 = vda). Fine up to vdz.
+fn disk(i: usize) -> String {
+    format!("/dev/vd{}", (b'a' + i as u8) as char)
 }
 
 pub fn early() -> io::Result<Cmdline> {
@@ -70,6 +85,14 @@ pub fn early() -> io::Result<Cmdline> {
         mkdir_p(d)?;
     }
     mount("/dev/vda", LOWER, "erofs", libc::MS_RDONLY, "")?;
+    // overlayfs lists lower layers top first.
+    let mut lowers = vec![LOWER.to_string()];
+    for i in 0..cmdline.layers {
+        let dir = format!("/mnt/layer{i}");
+        mkdir_p(&dir)?;
+        mount(&disk(i + 2), &dir, "erofs", libc::MS_RDONLY, "")?;
+        lowers.insert(0, dir);
+    }
     mount("/dev/vdb", UPPER, "ext4", libc::MS_NOATIME, "")?;
     mkdir_p(&format!("{UPPER}/upper"))?;
     mkdir_p(&format!("{UPPER}/work"))?;
@@ -78,7 +101,10 @@ pub fn early() -> io::Result<Cmdline> {
         ROOT,
         "overlay",
         0,
-        &format!("lowerdir={LOWER},upperdir={UPPER}/upper,workdir={UPPER}/work"),
+        &format!(
+            "lowerdir={},upperdir={UPPER}/upper,workdir={UPPER}/work",
+            lowers.join(":")
+        ),
     )?;
 
     for d in ["dev", "proc", "sys"] {
@@ -214,5 +240,14 @@ mod tests {
             std::net::Ipv4Addr::new(100, 96, 0, 1)
         );
         assert!(Cmdline::parse("runt.name=x").net.is_none());
+        assert_eq!(Cmdline::parse("runt.layers=3").layers, 3);
+        assert_eq!(Cmdline::parse("runt.layers=999").layers, 0);
+        assert_eq!(Cmdline::parse("").layers, 0);
+    }
+
+    #[test]
+    fn names_disks() {
+        assert_eq!(disk(0), "/dev/vda");
+        assert_eq!(disk(2), "/dev/vdc");
     }
 }

@@ -52,11 +52,50 @@ runt rm -f work                    # when done
   Start long-running servers in the background:
   `runt exec work -- sh -c 'nohup npm run dev >/tmp/dev.log 2>&1 &'`.
 
+## Projects: runt.toml
+
+For an app that should keep running (a dev server, a database), describe its
+VM in `runt.toml` at the project root and run `runt up --json` there. It builds
+the image (unchanged steps are cached), creates or updates the VM named `name`,
+and keeps the services running. Rerun it after editing the file or the copied
+sources; it only redoes what changed.
+
+```toml
+name = "myapp"                     # also the VM's name
+[vm]
+cpus = 2                           # default 2
+memory = "1G"                      # default 1G
+[build]                            # steps run as root, with internet access
+steps = [
+  { run = "apt-get update && apt-get install -y python3-flask" },
+  { copy = ".", to = "/app", exclude = [".git", "__pycache__"] },
+]
+[env]                              # build steps, services and `runt exec`
+PORT = "8000"
+[services.web]                     # restart = "always" (default),
+cmd = "flask --app app run --host 0.0.0.0 --port $PORT"  # "on-failure", "never"
+cwd = "/app"
+[network]                          # optional: what the running VM may reach
+allow = ["api.github.com"]         # (same rules as --allow)
+[dev]                              # applied by `runt up` on this machine
+mounts = [".:/app"]                # live-edit the sources instead of the copy
+```
+
+- `copy` paths are relative to the project and keep their relative paths
+  under `to` (`copy = "src"` gives `/app/src`). `exclude` takes gitignore-style
+  names (`node_modules`, `*.log`, `/build`).
+- A new image recreates the VM with a fresh disk; anything the app must keep
+  belongs in a `[dev] mounts` folder. Other changes restart only what changed.
+- `runt logs myapp -s web` shows a service's output (`-f` follows);
+  `runt ls --json` shows whether services run and their last exit code.
+- A failed step exits 125 with `build_failed`; the hint names the full build log.
+- `runt down` stops the VM, `runt down --rm` removes it.
+
 ## Managing VMs
 
 | Command | Purpose |
 | --- | --- |
-| `runt ls --json` | VMs with status, shares, network policy, ports |
+| `runt ls --json` | VMs with status, shares, network policy, ports, services |
 | `runt stop VM` / `runt start VM` | Shut down / boot again; the disk persists |
 | `runt rm -f VM` | Delete VM and disk |
 | `runt logs VM` | Guest console (boot problems) |

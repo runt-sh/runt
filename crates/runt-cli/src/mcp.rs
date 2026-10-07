@@ -361,6 +361,7 @@ fn vm_create(cfg: &Config, args: &Map<String, Value>) -> ToolResult {
         egress,
         mounts,
         created_by: Some(CREATOR.into()),
+        ..Default::default()
     })?;
     let mut text = format!("created VM {:?} (booted in {boot_ms} ms)", rec.name);
     for m in &rec.mounts {
@@ -445,7 +446,7 @@ fn vm_exec(cfg: &Config, args: &Map<String, Value>) -> ToolResult {
         conn,
         client::ExecOpts {
             argv: vec!["/bin/sh".into(), "-c".into(), command.into()],
-            env,
+            env: ops::exec_env(&rec, env),
             cwd,
             tty: false,
         },
@@ -622,6 +623,7 @@ mod tests {
             mounts: vec![],
             egress: Egress::default(),
             created_by: by.map(String::from),
+            ..Default::default()
         };
         let mut c = cfg(Path::new("/"));
         assert!(c.may_use(&rec("a", Some(CREATOR))));

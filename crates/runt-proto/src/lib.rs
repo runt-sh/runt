@@ -20,7 +20,7 @@ use std::thread;
 
 use serde::{Deserialize, Serialize};
 
-pub const VERSION: u32 = 0;
+pub const VERSION: u32 = 1;
 
 /// Guest vsock port runt-agent listens on.
 pub const AGENT_PORT: u32 = 1024;
@@ -99,6 +99,43 @@ pub enum Msg {
     Error {
         message: String,
     },
+    /// Make these the VM's services: start new ones, restart changed ones,
+    /// stop ones no longer listed. Answered with [`Msg::ServiceList`].
+    SetServices(Vec<Service>),
+    /// Ask for the services' state. Answered with [`Msg::ServiceList`].
+    GetServices,
+    ServiceList(Vec<ServiceStatus>),
+}
+
+/// A long-running program the agent keeps running (from `runt.toml`).
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+pub struct Service {
+    pub name: String,
+    pub argv: Vec<String>,
+    pub env: Vec<(String, String)>,
+    pub cwd: Option<String>,
+    pub restart: Restart,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum Restart {
+    /// Whenever it exits.
+    #[default]
+    Always,
+    /// When it exits with a non-zero code or a signal.
+    OnFailure,
+    Never,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ServiceStatus {
+    pub name: String,
+    /// Set while it runs.
+    pub pid: Option<u32>,
+    /// Times it was restarted after exiting.
+    pub restarts: u32,
+    /// How it last exited (128+N for signal N).
+    pub last_exit: Option<i32>,
 }
 
 #[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
@@ -311,6 +348,19 @@ mod tests {
             Msg::Ports {
                 listening: vec![22, 3000, 8080],
             },
+            Msg::SetServices(vec![Service {
+                name: "web".into(),
+                argv: vec!["/bin/sh".into(), "-c".into(), "serve".into()],
+                env: vec![("PORT".into(), "3000".into())],
+                cwd: Some("/app".into()),
+                restart: Restart::OnFailure,
+            }]),
+            Msg::ServiceList(vec![ServiceStatus {
+                name: "web".into(),
+                pid: Some(7),
+                restarts: 2,
+                last_exit: Some(137),
+            }]),
         ];
         for m in &msgs {
             a.send(m).unwrap();

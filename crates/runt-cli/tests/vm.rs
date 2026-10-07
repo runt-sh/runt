@@ -582,3 +582,173 @@ fn mcp_server() {
     assert!(child.wait().unwrap().success());
     std::fs::remove_dir_all(&dir).unwrap();
 }
+
+fn runt_in(dir: &std::path::Path, args: &[&str]) -> Output {
+    Command::new(env!("CARGO_BIN_EXE_runt"))
+        .args(args)
+        .current_dir(dir)
+        .output()
+        .expect("run runt")
+}
+
+fn json(o: &Output) -> serde_json::Value {
+    assert!(
+        o.status.success(),
+        "runt failed: {}",
+        String::from_utf8_lossy(&o.stderr)
+    );
+    serde_json::from_slice(&o.stdout).unwrap()
+}
+
+/// Removes a project's VM (and its directory) however the test ends.
+struct Project(std::path::PathBuf, String);
+
+impl Drop for Project {
+    fn drop(&mut self) {
+        runt(&["rm", "-f", &self.1]);
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+#[test]
+#[ignore]
+fn recipes_build_and_run() {
+    let name = format!("test-recipe-{}", std::process::id());
+    let dir = std::env::temp_dir().join(&name);
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(dir.join("skip")).unwrap();
+    let p = Project(dir.clone(), name.clone());
+    std::fs::write(dir.join("hello.txt"), "hello\n").unwrap();
+    std::fs::write(dir.join("skip/secret.txt"), "nope").unwrap();
+    // Layers are shared by every project with the same steps, so the first
+    // step names this test run to start from an empty cache. Layer 1 also
+    // deletes a base file and makes a tree; layer 3 replaces part
+    // of it, so whiteouts and opaque directories have to survive stacking,
+    // both fresh and (on the rebuild below) from cached layer disks.
+    std::fs::write(
+        dir.join("runt.toml"),
+        format!(
+            r#"
+name = "{name}"
+[vm]
+memory = "512M"
+[build]
+steps = [
+  {{ run = "echo {name} > /name && rm /usr/bin/curl && mkdir -p /data/sub && echo base > /data/sub/x && echo gone > /data/gone" }},
+  {{ copy = ".", to = "/app", exclude = ["skip"] }},
+  {{ run = "test ! -e /usr/bin/curl && rm /data/gone && rm -r /data/sub && mkdir /data/sub && echo new > /data/sub/y && cat hello.txt > /built && echo $FROM_ENV > /env-at-build", cwd = "/app" }},
+]
+[env]
+FROM_ENV = "recipe-env"
+[services.counter]
+cmd = "while true; do echo tick $FROM_ENV $OWN; sleep 0.2; done"
+env = {{ OWN = "svc" }}
+[services.oneshot]
+cmd = "echo ran"
+restart = "never"
+"#
+        ),
+    )
+    .unwrap();
+
+    let v = json(&runt_in(&dir, &["up", "--json"]));
+    assert_eq!(v["action"], "created");
+    assert_eq!(v["build"]["cached"], 0);
+    assert_eq!(v["build"]["layers"].as_array().unwrap().len(), 3);
+
+    let check = |script: &str| {
+        let o = runt(&["exec", &name, "--", "sh", "-c", script]);
+        assert!(
+            o.status.success(),
+            "{script}: {}{}",
+            stdout(&o),
+            String::from_utf8_lossy(&o.stderr)
+        );
+        stdout(&o)
+    };
+    check("test ! -e /usr/bin/curl && test ! -e /data/gone && test ! -e /data/sub/x");
+    assert_eq!(
+        check("cat /data/sub/y /built /env-at-build"),
+        "new\nhello\nrecipe-env\n"
+    );
+    assert_eq!(check("ls /app"), "hello.txt\nrunt.toml\n");
+    assert_eq!(check("stat -c %U /app/hello.txt"), "root\n");
+    assert_eq!(check("printenv FROM_ENV"), "recipe-env\n");
+
+    // Services run with the recipe's environment and their own; a
+    // restart = "never" service runs once.
+    std::thread::sleep(std::time::Duration::from_millis(600));
+    let o = runt(&["logs", &name, "-s", "counter"]);
+    assert!(stdout(&o).contains("tick recipe-env svc"), "{}", stdout(&o));
+    assert_eq!(stdout(&runt(&["logs", &name, "-s", "oneshot"])), "ran\n");
+    let list = json(&runt(&["ls", "--json"]));
+    let me = list
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|v| v["name"] == name.as_str())
+        .unwrap();
+    let svc = |n: &str| {
+        me["services"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|s| s["name"] == n)
+            .unwrap()
+            .clone()
+    };
+    assert_eq!(svc("counter")["running"], true);
+    assert_eq!(svc("oneshot")["running"], false);
+    assert_eq!(svc("oneshot")["last_exit"], 0);
+    assert_eq!(svc("oneshot")["restarts"], 0);
+
+    // Nothing changed: nothing happens.
+    let v = json(&runt_in(&dir, &["up", "--json"]));
+    assert_eq!(v["action"], "unchanged");
+    assert_eq!(v["build"]["cached"], 3);
+
+    // A copied file changed: that layer and the ones above it rebuild on
+    // the cached first layer, and the VM is recreated from the new image.
+    std::fs::write(dir.join("hello.txt"), "hello again\n").unwrap();
+    let v = json(&runt_in(&dir, &["up", "--json"]));
+    assert_eq!(v["action"], "recreated");
+    assert_eq!(v["build"]["cached"], 1);
+    assert_eq!(check("cat /built"), "hello again\n");
+    check("test ! -e /usr/bin/curl && test ! -e /data/sub/x");
+
+    let v = json(&runt_in(&dir, &["down", "--rm", "--json"]));
+    assert_eq!(v["status"], "removed");
+    assert!(!stdout(&runt(&["ls"])).contains(&name));
+    drop(p);
+}
+
+#[test]
+#[ignore]
+fn failed_builds_clean_up_and_resume() {
+    let name = format!("test-failbuild-{}", std::process::id());
+    let dir = std::env::temp_dir().join(&name);
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let _p = Project(dir.clone(), name.clone());
+    let recipe = |second: &str| {
+        let text = format!(
+            "name = \"{name}\"\n[build]\nsteps = [{{ run = \"echo {name} > /one\" }}, {{ run = \"{second}\" }}]\n"
+        );
+        std::fs::write(dir.join("runt.toml"), text).unwrap();
+    };
+    recipe("echo failing; exit 3");
+    let o = runt_in(&dir, &["build", "--json"]);
+    assert_eq!(o.status.code(), Some(125));
+    let e: serde_json::Value = serde_json::from_slice(&o.stderr).unwrap();
+    assert_eq!(e["error"]["code"], "build_failed");
+    assert!(e["error"]["message"].as_str().unwrap().contains("step 2"));
+    let log = e["error"]["hint"].as_str().unwrap();
+    let log = std::fs::read_to_string(log.trim_start_matches("full output: ")).unwrap();
+    assert!(log.contains("failing"), "{log}");
+    assert!(!stdout(&runt(&["ls"])).contains("runt-build-"));
+
+    // The first step's layer was kept.
+    recipe("true");
+    let v = json(&runt_in(&dir, &["build", "--json"]));
+    assert_eq!(v["cached"], 1);
+}

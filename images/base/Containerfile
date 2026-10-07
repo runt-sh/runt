@@ -1,5 +1,6 @@
 # runt base image: Debian (glibc, for compatibility with prebuilt wheels and
-# native modules) plus the tools an agent reaches for first.
+# native modules) plus the tools an agent reaches for first. `runt build`
+# also runs its steps from this image, which is why erofs-utils is here.
 FROM docker.io/library/debian:trixie-slim
 
 # Keep docs, man pages and translations out of the image (dpkg honours this
@@ -13,7 +14,7 @@ RUN printf '%s\n' \
 
 RUN apt-get update \
  && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
-      ca-certificates curl git iproute2 iputils-ping procps \
+      ca-certificates curl erofs-utils git iproute2 iputils-ping procps \
  && find /usr/share/doc -mindepth 1 -not -name copyright -not -type d -delete \
  && rm -rf /usr/share/man/* /usr/share/info/* /usr/share/locale/*/ \
       /var/lib/apt/lists/* /var/cache/apt/*.bin /var/cache/debconf/*-old /var/log/apt /var/log/dpkg.log

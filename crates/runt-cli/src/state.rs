@@ -10,8 +10,11 @@
 //! $XDG_RUNTIME_DIR/runt/<name>/agent.sock       agent socket (libkrun listens)
 //!                              ready.sock, events.sock, ports.json, sandbox.json
 //! $XDG_CACHE_HOME/runt/{vmlinux,initramfs.cpio,images/base.erofs}
+//!                      layers/<key>.erofs     image layers built from recipes
+//!                      projects/<id>.json     each project's latest build
 //! ```
 
+use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -20,7 +23,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::error::{CliError, Result};
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct VmRecord {
     pub name: String,
     pub cpus: u8,
@@ -34,9 +37,23 @@ pub struct VmRecord {
     pub mounts: Vec<crate::mounts::Mount>,
     #[serde(default)]
     pub egress: Egress,
-    /// What created the VM, if not a person at the CLI (`"mcp"`).
+    /// What created the VM, if not a person at the CLI (`"mcp"`, `"build"`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub created_by: Option<String>,
+    /// Directory of the runt.toml this VM runs (`runt up`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub project: Option<PathBuf>,
+    /// Image layers on top of the base, bottom first (keys in `layers/`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub layers: Vec<String>,
+    /// More read-only disks, attached after the layers but not mounted.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub disks: Vec<PathBuf>,
+    /// Environment for services and `runt exec`.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub env: BTreeMap<String, String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub services: Vec<crate::recipe::ServiceDef>,
 }
 
 /// What a NAT VM's network may reach beyond the default (public internet).
@@ -141,6 +158,18 @@ pub fn vms_dir() -> PathBuf {
 
 pub fn cache_dir() -> PathBuf {
     xdg("XDG_CACHE_HOME", ".cache").join("runt")
+}
+
+pub fn layers_dir() -> PathBuf {
+    cache_dir().join("layers")
+}
+
+pub fn layer_path(key: &str) -> PathBuf {
+    layers_dir().join(format!("{key}.erofs"))
+}
+
+pub fn projects_dir() -> PathBuf {
+    cache_dir().join("projects")
 }
 
 pub fn vm_dir(name: &str) -> PathBuf {

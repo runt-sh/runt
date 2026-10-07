@@ -30,13 +30,84 @@ $ runt exec --json nimble-shrew -- sh -c 'echo hi; exit 3'
 | `runt stop VM` / `runt start VM` | Shut down / boot again (the disk is kept) |
 | `runt rm [-f] VM` | Delete a VM and its disk |
 | `runt port VM` | Ports forwarded from the VM to this machine |
-| `runt logs VM [--egress]` | Guest console log, or refused network connections |
+| `runt logs VM [--egress] [-s SERVICE [-f]]` | Guest console log, refused network connections, or a service's output |
+| `runt up` / `runt down [--rm]` | Run the project in `runt.toml` / stop (or remove) its VM |
+| `runt build` | Build `runt.toml`'s image without running it |
 | `runt mcp` | MCP server for AI agents (see below) |
 | `runt skill [--install]` | Print or install the agent skill (see below) |
 
 Add `--json` to any command for machine-readable output. runt's own errors
 exit with 125 and, in JSON mode, print `{"error": {"code", "message", "hint"}}`
 to stderr.
+
+## Projects: `runt.toml`
+
+A `runt.toml` at the root of a project describes its VM: how to build the
+image, which services to keep running, and what the network may reach.
+`runt up` builds it and runs it.
+
+```toml
+name = "myapp"                     # the VM's name
+
+[vm]
+cpus = 2
+memory = "1G"
+
+[build]
+steps = [
+  { run = "apt-get update && apt-get install -y python3-flask" },
+  { copy = ".", to = "/app", exclude = [".git", "__pycache__"] },
+]
+
+[env]                              # for build steps, services and `runt exec`
+PORT = "8000"
+
+[services.web]
+cmd = "flask --app app run --host 0.0.0.0 --port $PORT"
+cwd = "/app"
+
+[network]                          # optional, like `runt new --allow`
+allow = ["api.github.com"]
+
+[dev]                              # what `runt up` adds on this machine
+mounts = [".:/app"]                # edit the live sources, not the copy
+```
+
+```console
+$ runt up
+building myapp (2 steps)
+[1/2] run apt-get update && apt-get install -y python3-flask
+...
+[2/2] copy . -> /app
+built myapp in 20.3 s (0 of 2 steps cached)
+myapp is up: created and booted in 152 ms
+  service web: running (pid 54)
+  http://127.0.0.1:8000 -> port 8000 in the VM
+logs: runt logs myapp -s web
+```
+
+- **Builds are cached step by step.** Each step becomes an image layer, keyed
+  by everything that shapes it: the base image, the steps before it, the step
+  itself, `[env]`, and for `copy`, the exact files copied (contents and
+  permissions, not timestamps). Rerunning `runt up` redoes only steps whose
+  inputs changed. A failed build keeps the steps that succeeded.
+- **Builds run in a throwaway VM.** Steps run as root and can reach the
+  public internet; nothing is needed on your machine besides runt. The build
+  VM sees only the files being copied and writes only to a scratch
+  directory, from which runt takes just the layers it asked for.
+- **`copy`** takes paths relative to the project, which keep their relative
+  paths under `to`. `exclude` takes gitignore-style patterns: `node_modules`
+  matches anywhere, `/build` only at the top, `*.log` any log file. Copied
+  files are owned by root and dated 1980-01-01, so builds are reproducible.
+- **Services** are restarted when they exit (`restart = "always"`, the
+  default; or `"on-failure"`, `"never"`), with backoff. Their output goes to
+  `runt logs VM -s NAME`.
+- **`runt up` changes as little as it can.** Changed services restart on
+  their own, CPU, memory, mount and network changes reboot the VM, and a new
+  image replaces it with a fresh disk. Keep data that must survive in a
+  `[dev] mounts` folder for now (volumes are planned).
+- **Images build on runt's Debian base** (`runt/base`). Other bases, volumes,
+  secrets and `runt deploy` are on the way.
 
 ## AI agents
 

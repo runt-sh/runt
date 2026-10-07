@@ -1,12 +1,17 @@
 //! Operations shared by the CLI commands and the MCP server.
 
+use std::collections::BTreeMap;
+use std::path::PathBuf;
+
 use serde_json::{Value, json};
 
 use crate::error::Result;
 use crate::mounts::Mount;
+use crate::recipe::ServiceDef;
 use crate::state::{self, Egress, NetMode, Status, VmRecord};
 use crate::{names, ports, vm};
 
+#[derive(Default)]
 pub struct NewSpec {
     pub name: Option<String>,
     pub cpus: u8,
@@ -15,6 +20,11 @@ pub struct NewSpec {
     pub egress: Egress,
     pub mounts: Vec<Mount>,
     pub created_by: Option<String>,
+    pub project: Option<PathBuf>,
+    pub layers: Vec<String>,
+    pub disks: Vec<PathBuf>,
+    pub env: BTreeMap<String, String>,
+    pub services: Vec<ServiceDef>,
 }
 
 /// Create and boot a VM; returns its record and boot time in ms. A VM that
@@ -29,10 +39,13 @@ pub fn new_vm(spec: NewSpec) -> Result<(VmRecord, u128)> {
         spec.egress,
         spec.mounts,
     )?;
-    if spec.created_by.is_some() {
-        rec.created_by = spec.created_by;
-        state::save(&rec)?;
-    }
+    rec.created_by = spec.created_by;
+    rec.project = spec.project;
+    rec.layers = spec.layers;
+    rec.disks = spec.disks;
+    rec.env = spec.env;
+    rec.services = spec.services;
+    state::save(&rec)?;
     match vm::start(&mut rec) {
         Ok(ms) => Ok((rec, ms)),
         Err(e) => {
@@ -40,6 +53,16 @@ pub fn new_vm(spec: NewSpec) -> Result<(VmRecord, u128)> {
             Err(e)
         }
     }
+}
+
+/// A command's environment in a VM: the VM's own (from its recipe), then
+/// what the caller asked for.
+pub fn exec_env(rec: &VmRecord, extra: Vec<(String, String)>) -> Vec<(String, String)> {
+    rec.env
+        .iter()
+        .map(|(k, v)| (k.clone(), v.clone()))
+        .chain(extra)
+        .collect()
 }
 
 fn unused_random_name() -> String {
@@ -71,16 +94,32 @@ pub fn vm_json(r: &VmRecord) -> Value {
     } else {
         vec![]
     };
+    let services = (running && !r.services.is_empty())
+        .then(|| crate::client::get_services(&r.name).ok())
+        .flatten();
     json!({
         "name": r.name, "status": status, "cpus": r.cpus,
         "mem_mib": r.mem_mib, "created": r.created, "created_by": r.created_by,
-        "net": r.net,
+        "project": r.project, "net": r.net,
         "mounts": r.mounts, "egress": egress_json(r),
+        "services": services.map(|s| services_json(&s))
+            .unwrap_or_else(|| json!(r.services.iter().map(|s| json!({"name": s.name})).collect::<Vec<_>>())),
         "sandbox": running.then(|| vm::SandboxStatus::read(&r.name)).flatten(),
         "ports": ports.iter()
             .map(|m| json!({ "guest": m.guest, "host": m.host }))
             .collect::<Vec<_>>(),
     })
+}
+
+pub fn services_json(list: &[runt_proto::ServiceStatus]) -> Value {
+    json!(
+        list.iter()
+            .map(|s| json!({
+                "name": s.name, "running": s.pid.is_some(), "pid": s.pid,
+                "restarts": s.restarts, "last_exit": s.last_exit,
+            }))
+            .collect::<Vec<_>>()
+    )
 }
 
 /// `null` for offline VMs; otherwise what the network may reach.
