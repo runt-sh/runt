@@ -1,0 +1,336 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://raw.githubusercontent.com/runt-sh/runt/main/schema/runt.schema.json",
+  "title": "runt.toml",
+  "description": "A runt project: the image to build, and the VM `runt up` runs from it. https://github.com/runt-sh/runt",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "name"
+  ],
+  "properties": {
+    "name": {
+      "description": "Names the project and its VM: 1-48 lowercase letters, digits and dashes.",
+      "type": "string",
+      "pattern": "^[a-z0-9]([a-z0-9-]{0,46}[a-z0-9])?$"
+    },
+    "vm": {
+      "description": "The VM's resources.",
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "cpus": {
+          "description": "Virtual CPUs.",
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 64,
+          "default": 2
+        },
+        "memory": {
+          "description": "Memory: MiB, or with a unit (512M, 2G). At least 128M.",
+          "type": "string",
+          "pattern": "^\\s*[0-9]+[MmGg]?\\s*$",
+          "default": "1G"
+        }
+      }
+    },
+    "build": {
+      "description": "How the image is built. Each step is a cached layer; a step reruns when it, a step before it, [env] or the files it copies change.",
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "base": {
+          "description": "The image to start from.",
+          "enum": [
+            "runt/base"
+          ],
+          "default": "runt/base"
+        },
+        "steps": {
+          "description": "Run in order, as root, with internet access.",
+          "type": "array",
+          "maxItems": 16,
+          "items": {
+            "oneOf": [
+              {
+                "$ref": "#/definitions/runStep"
+              },
+              {
+                "$ref": "#/definitions/copyStep"
+              }
+            ]
+          }
+        }
+      }
+    },
+    "env": {
+      "description": "Environment variables for build steps, services and `runt exec`.",
+      "allOf": [
+        {
+          "$ref": "#/definitions/env"
+        }
+      ]
+    },
+    "services": {
+      "description": "Long-running processes the VM keeps running, by name.",
+      "type": "object",
+      "propertyNames": {
+        "$ref": "#/definitions/name"
+      },
+      "additionalProperties": {
+        "$ref": "#/definitions/service"
+      }
+    },
+    "http": {
+      "description": "Serve the app at http://NAME.runt.localhost.",
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "port": {
+          "description": "The port the app listens on inside the VM.",
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 65535
+        }
+      }
+    },
+    "volumes": {
+      "description": "Persistent disks, by name: they keep their data when a new image recreates the VM. Each is a path, or { path, size }.",
+      "type": "object",
+      "maxProperties": 8,
+      "propertyNames": {
+        "$ref": "#/definitions/name"
+      },
+      "additionalProperties": {
+        "oneOf": [
+          {
+            "$ref": "#/definitions/volumePath"
+          },
+          {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "path"
+            ],
+            "properties": {
+              "path": {
+                "$ref": "#/definitions/volumePath"
+              },
+              "size": {
+                "description": "64M to 16T; it can grow later but not shrink.",
+                "type": "string",
+                "pattern": "^\\s*[0-9]+[MmGgTt]\\s*$",
+                "default": "1G"
+              }
+            }
+          }
+        ]
+      }
+    },
+    "network": {
+      "description": "What the running VM may reach. Default: the public internet, but not this machine or its LAN.",
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "allow": {
+          "description": "Reach only these: example.com (exactly), *.example.com (subdomains), IPv4 addresses and networks (10.0.0.0/8).",
+          "type": "array",
+          "items": {
+            "type": "string",
+            "minLength": 1
+          }
+        },
+        "allow_lan": {
+          "description": "Also reach private networks around this machine (LAN, VPNs).",
+          "type": "boolean",
+          "default": false
+        }
+      }
+    },
+    "dev": {
+      "description": "Applied by `runt up` on this machine, on top of the rest.",
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "mounts": {
+          "description": "Share host directories: SRC[:DST][:ro], SRC relative to the project; DST defaults to the same path. On x86_64 a VM fits 3 shares and volumes together.",
+          "type": "array",
+          "maxItems": 16,
+          "items": {
+            "type": "string",
+            "minLength": 1
+          }
+        },
+        "env": {
+          "description": "Added to [env] for the running VM (not for builds).",
+          "allOf": [
+            {
+              "$ref": "#/definitions/env"
+            }
+          ]
+        },
+        "services": {
+          "description": "Override [services] keys, or add services.",
+          "type": "object",
+          "propertyNames": {
+            "$ref": "#/definitions/name"
+          },
+          "additionalProperties": {
+            "$ref": "#/definitions/serviceFields"
+          }
+        }
+      }
+    }
+  },
+  "definitions": {
+    "name": {
+      "type": "string",
+      "pattern": "^[a-z0-9_-]{1,32}$"
+    },
+    "absolutePath": {
+      "type": "string",
+      "pattern": "^/"
+    },
+    "volumePath": {
+      "description": "Where the volume is mounted in the VM: an absolute path, not / or a system directory.",
+      "allOf": [
+        {
+          "$ref": "#/definitions/absolutePath"
+        }
+      ],
+      "not": {
+        "pattern": "^/*$|^/+(bin|boot|dev|etc|lib|lib32|lib64|libx32|proc|run|sbin|sys|usr|var)/*$|^/+(proc|sys|dev|run)(/|$)"
+      }
+    },
+    "env": {
+      "type": "object",
+      "propertyNames": {
+        "pattern": "^[A-Za-z_][A-Za-z0-9_]*$"
+      },
+      "additionalProperties": {
+        "type": [
+          "string",
+          "integer",
+          "boolean"
+        ]
+      }
+    },
+    "runStep": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "run"
+      ],
+      "properties": {
+        "run": {
+          "description": "A shell command (sh -c), run as root.",
+          "type": "string",
+          "pattern": "\\S"
+        },
+        "cwd": {
+          "description": "Directory to run it in; created if missing.",
+          "default": "/",
+          "allOf": [
+            {
+              "$ref": "#/definitions/absolutePath"
+            }
+          ]
+        }
+      }
+    },
+    "copyStep": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "copy",
+        "to"
+      ],
+      "properties": {
+        "copy": {
+          "description": "Project paths (relative, inside the project) to copy, keeping their relative paths. A string may list several, separated by spaces.",
+          "oneOf": [
+            {
+              "type": "string",
+              "pattern": "\\S",
+              "not": {
+                "pattern": "(^|\\s)/|(^|[\\s/])\\.\\.(/|\\s|$)"
+              }
+            },
+            {
+              "type": "array",
+              "minItems": 1,
+              "items": {
+                "type": "string",
+                "minLength": 1,
+                "not": {
+                  "pattern": "^/|(^|/)\\.\\.(/|$)"
+                }
+              }
+            }
+          ]
+        },
+        "to": {
+          "description": "Directory in the image to copy into.",
+          "allOf": [
+            {
+              "$ref": "#/definitions/absolutePath"
+            }
+          ]
+        },
+        "exclude": {
+          "description": "gitignore-style patterns to leave out: node_modules, *.log, /build.",
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
+      }
+    },
+    "serviceFields": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "cmd": {
+          "description": "A shell command (sh -c).",
+          "type": "string",
+          "pattern": "\\S"
+        },
+        "cwd": {
+          "description": "Directory to run it in.",
+          "allOf": [
+            {
+              "$ref": "#/definitions/absolutePath"
+            }
+          ]
+        },
+        "env": {
+          "description": "Added to [env] for this service.",
+          "allOf": [
+            {
+              "$ref": "#/definitions/env"
+            }
+          ]
+        },
+        "restart": {
+          "description": "When to start it again after it exits.",
+          "enum": [
+            "always",
+            "on-failure",
+            "never"
+          ],
+          "default": "always"
+        }
+      }
+    },
+    "service": {
+      "allOf": [
+        {
+          "$ref": "#/definitions/serviceFields"
+        }
+      ],
+      "required": [
+        "cmd"
+      ]
+    }
+  }
+}

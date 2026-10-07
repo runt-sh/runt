@@ -900,3 +900,112 @@ data = {{ path = "/data", size = "{size}" }}
     );
     drop(p);
 }
+
+#[test]
+#[ignore]
+fn mcp_projects() {
+    use std::io::{BufRead, BufReader, Write};
+    use std::process::Stdio;
+
+    let name = format!("test-mcpp-{}", std::process::id());
+    let dir = std::env::temp_dir().join(&name);
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let _p = Project(dir.clone(), name.clone());
+    std::fs::write(dir.join("app.txt"), "from the project\n").unwrap();
+    let recipe = |last: &str| {
+        let text = format!(
+            r#"
+name = "{name}"
+[vm]
+memory = "512M"
+[build]
+steps = [{{ run = "echo {name} > /name" }}, {{ copy = "app.txt", to = "/app" }}, {{ run = "{last}" }}]
+[services.idle]
+cmd = "sleep 1000"
+"#
+        );
+        std::fs::write(dir.join("runt.toml"), text).unwrap();
+    };
+    recipe("true");
+
+    let mut child = Command::new(env!("CARGO_BIN_EXE_runt"))
+        .arg("mcp")
+        .current_dir(&dir)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut stdin = child.stdin.take().unwrap();
+    let mut stdout = BufReader::new(child.stdout.take().unwrap());
+    let mut id = 0;
+    // Calls a tool with a progress token; returns the result and the
+    // progress messages that came first.
+    let mut call = |tool: &str, args: serde_json::Value| {
+        id += 1;
+        let req = serde_json::json!({ "jsonrpc": "2.0", "id": id, "method": "tools/call",
+            "params": { "name": tool, "arguments": args, "_meta": { "progressToken": id } } });
+        writeln!(stdin, "{req}").unwrap();
+        let mut progress = Vec::new();
+        loop {
+            let mut line = String::new();
+            stdout.read_line(&mut line).unwrap();
+            let v: serde_json::Value = serde_json::from_str(&line).unwrap();
+            if v["method"] == "notifications/progress" {
+                assert_eq!(v["params"]["progressToken"], id);
+                progress.push(v["params"]["message"].as_str().unwrap().to_string());
+                continue;
+            }
+            assert_eq!(v["id"], id);
+            return (v["result"].clone(), progress);
+        }
+    };
+
+    let (r, progress) = call("project_up", serde_json::json!({}));
+    assert_ne!(r["isError"], true, "{r}");
+    assert_eq!(progress.len(), 3, "{progress:?}");
+    assert!(
+        progress[1].starts_with("[2/3] copy app.txt"),
+        "{progress:?}"
+    );
+    let v = &r["structuredContent"];
+    assert_eq!(
+        (v["name"].as_str(), v["action"].as_str()),
+        (Some(name.as_str()), Some("created"))
+    );
+    assert_eq!(v["services"][0]["running"], true, "{v}");
+    let text = r["content"][0]["text"].as_str().unwrap();
+    assert!(text.contains("service idle: running"), "{text}");
+
+    // The project's VM is the agent's to use.
+    let (r, _) = call(
+        "vm_exec",
+        serde_json::json!({ "vm": name, "command": "cat /name /app/app.txt" }),
+    );
+    assert_eq!(
+        r["structuredContent"]["stdout"],
+        format!("{name}\nfrom the project\n"),
+        "{r}"
+    );
+
+    // Unchanged: nothing to do. A failed step returns the end of its log.
+    let (r, progress) = call("project_up", serde_json::json!({ "path": "runt.toml" }));
+    assert_eq!(r["structuredContent"]["action"], "unchanged", "{r}");
+    assert!(
+        progress.iter().all(|p| p.ends_with("(cached)")),
+        "{progress:?}"
+    );
+    recipe("echo step-output-marker; exit 3");
+    let (r, _) = call("project_build", serde_json::json!({}));
+    assert_eq!(r["isError"], true, "{r}");
+    let text = r["content"][0]["text"].as_str().unwrap();
+    assert!(text.contains("build_failed"), "{text}");
+    assert!(text.contains("step-output-marker"), "{text}");
+
+    let (r, _) = call("project_down", serde_json::json!({ "remove": true }));
+    assert_eq!(r["structuredContent"]["status"], "removed", "{r}");
+    drop(stdin);
+    assert!(child.wait().unwrap().success());
+    let ls = runt(&["ls", "--json"]);
+    assert!(!String::from_utf8_lossy(&ls.stdout).contains("runt-build-"));
+}

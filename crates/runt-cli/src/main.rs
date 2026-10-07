@@ -145,6 +145,8 @@ enum Cmd {
         #[arg(long, requires = "rm")]
         volumes: bool,
     },
+    /// Print the JSON Schema of runt.toml, for editors and validators
+    Schema,
     /// List or delete volumes (persistent data from runt.toml's [volumes])
     #[command(subcommand, alias = "volumes")]
     Volume(VolumeCmd),
@@ -440,7 +442,7 @@ fn run(cli: Cli) -> Result<i32> {
         }
         Cmd::Build => {
             let r = recipe::load(&recipe::find(&std::env::current_dir()?)?)?;
-            let b = build::build(&r, !json)?;
+            let b = build::build(&r, output(json))?;
             if json {
                 print_json(json!({
                     "name": r.name, "layers": b.layers, "steps": r.steps.len(),
@@ -451,52 +453,13 @@ fn run(cli: Cli) -> Result<i32> {
         }
         Cmd::Up => {
             let r = recipe::load(&recipe::find(&std::env::current_dir()?)?)?;
-            let up = project::up(&r, !json)?;
-            let name = &up.rec.name;
-            let maps = ports::read(name);
+            let up = project::up(&r, output(json), None)?;
             if json {
-                print_json(json!({
-                    "name": name, "status": "running", "action": up.action,
-                    "reason": up.reason, "boot_ms": up.boot_ms,
-                    "build": { "layers": up.built.layers, "cached": up.built.cached,
-                               "ms": up.built.ms, "log": up.built.log },
-                    "services": ops::services_json(&up.services),
-                    "url": router::url(&up.rec), "volumes": up.rec.volumes,
-                    "ports": maps.iter()
-                        .map(|m| json!({ "guest": m.guest, "host": m.host, "url": m.url() }))
-                        .collect::<Vec<_>>(),
-                }));
+                print_json(project::up_json(&up));
             } else {
-                let how = match (up.action, up.reason, up.boot_ms) {
-                    ("unchanged", ..) => "already up to date".to_string(),
-                    (a, Some(why), Some(ms)) => format!("{a} ({why}) and booted in {ms} ms"),
-                    (a, Some(why), None) => format!("{a} ({why})"),
-                    (a, None, Some(ms)) => format!("{a} and booted in {ms} ms"),
-                    (a, None, None) => a.to_string(),
-                };
-                eprintln!("{name} is up: {how}");
-                if up.action == "recreated" {
-                    eprintln!("  (the VM's own disk starts fresh with a new image)");
-                }
-                for s in &up.services {
-                    eprintln!("  service {}", project::describe(s));
-                }
-                for v in &up.rec.volumes {
-                    eprintln!(
-                        "  volume {} at {} ({})",
-                        v.name,
-                        v.path,
-                        volumes::format_size(v.size_mib)
-                    );
-                }
-                for m in &maps {
-                    eprintln!("  {} -> port {} in the VM", m.url(), m.guest);
-                }
-                if let Some(url) = router::url(&up.rec) {
-                    eprintln!("url: {url}");
-                }
+                eprintln!("{}", project::up_text(&up));
                 if let Some(s) = up.services.first() {
-                    eprintln!("logs: runt logs {name} -s {}", s.name);
+                    eprintln!("logs: runt logs {} -s {}", up.rec.name, s.name);
                 }
             }
             Ok(0)
@@ -514,6 +477,10 @@ fn run(cli: Cli) -> Result<i32> {
             } else {
                 eprintln!("{}: {status}", r.name);
             }
+            Ok(0)
+        }
+        Cmd::Schema => {
+            print!("{}", recipe::SCHEMA);
             Ok(0)
         }
         Cmd::Port { vm: name } => {
@@ -752,7 +719,7 @@ fn warn_if_unsandboxed(name: &str) {
 }
 
 /// The agent skill, shipped inside the binary so it matches this version.
-const SKILL: &str = include_str!("../../../skills/runt/SKILL.md");
+pub(crate) const SKILL: &str = include_str!("../../../skills/runt/SKILL.md");
 
 fn print_json(v: serde_json::Value) {
     println!("{v}");
@@ -770,6 +737,15 @@ fn parse_env(s: &str) -> Result<(String, String)> {
 }
 
 /// Parse sizes like "512M", "2G", "1024" (MiB) into MiB.
+/// Build progress: on stderr, unless the output is JSON.
+fn output(json: bool) -> build::Output<'static> {
+    if json {
+        build::Output::Quiet
+    } else {
+        build::Output::Stderr
+    }
+}
+
 pub fn parse_mem(s: &str) -> std::result::Result<u32, String> {
     let s = s.trim();
     let (num, mult) = match s.char_indices().last() {

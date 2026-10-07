@@ -8,18 +8,22 @@
 //! The operator decides what an agent may reach on this machine: shares are
 //! limited to `--mount-root` directories (default: the directory the server
 //! was started in), LAN access needs `--allow-lan`, and agents see only the
-//! VMs they created unless granted others (`--vm NAME`, `--all-vms`).
+//! VMs they created unless granted others (`--vm NAME`, `--all-vms`). The
+//! same goes for projects: a runt.toml must lie under a mount root, and so
+//! must its `[dev] mounts`.
 
 use std::io::{self, BufRead, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use serde_json::{Map, Value, json};
 
+use crate::build::{self, Output};
 use crate::error::{CliError, Result};
+use crate::recipe::{self, Recipe};
 use crate::state::{self, Egress, NetMode, Status};
-use crate::{client, mounts, ops, vm};
+use crate::{client, mounts, ops, project, vm};
 
 /// Protocol revisions we speak, newest first.
 const PROTOCOL_VERSIONS: &[&str] = &["2025-11-25", "2025-06-18", "2025-03-26", "2024-11-05"];
@@ -29,10 +33,14 @@ const MAX_TIMEOUT_S: u64 = 3600;
 /// Per output stream, per call.
 const OUTPUT_LIMIT: usize = 64 * 1024;
 const LOG_LIMIT: usize = 16 * 1024;
+/// How much of a failed build's log goes back to the agent.
+const BUILD_LOG_TAIL: usize = 4 * 1024;
 
 const INSTRUCTIONS: &str = "runt runs commands in fast, isolated Linux microVMs (Debian). \
 Create a VM once with vm_create (about 0.2 s), then run commands in it with vm_exec. \
-VMs persist until removed; ports a VM listens on are forwarded to 127.0.0.1 on this machine.";
+VMs persist until removed; ports a VM listens on are forwarded to 127.0.0.1 on this machine. \
+For a project with a runt.toml (image, services, volumes), project_up builds and runs it; \
+without one, its error explains the format.";
 
 pub struct Config {
     /// Directories shares may come from (canonical).
@@ -132,7 +140,19 @@ pub fn serve(cfg: Config) -> Result<()> {
         if method == "tools/call" {
             let (cfg, out) = (cfg.clone(), out.clone());
             std::thread::spawn(move || {
-                let reply = call_tool(&cfg, &params);
+                // Builds report each step when the client asks for progress.
+                let token = params.pointer("/_meta/progressToken").cloned();
+                let progress = |i: usize, n: usize, line: &str| {
+                    if let Some(token) = &token {
+                        send(
+                            &out,
+                            &json!({ "jsonrpc": "2.0", "method": "notifications/progress",
+                                "params": { "progressToken": token, "progress": i,
+                                            "total": n, "message": line } }),
+                        );
+                    }
+                };
+                let reply = call_tool(&cfg, &params, Output::Steps(&progress));
                 send(
                     &out,
                     &json!({ "jsonrpc": "2.0", "id": id, "result": reply }),
@@ -152,6 +172,8 @@ pub fn serve(cfg: Config) -> Result<()> {
         };
         send(&out, &resp);
     }
+    // The client is gone; don't leave its builds running.
+    build::abort_all();
     Ok(())
 }
 
@@ -179,6 +201,7 @@ fn initialize(params: &Value) -> Value {
 
 fn tools() -> Value {
     let vm = json!({ "type": "string", "description": "VM name" });
+    let path = json!({ "type": "string", "description": "Project dir or its runt.toml. Default: the server's cwd" });
     let strings =
         |d: &str| json!({ "type": "array", "items": { "type": "string" }, "description": d });
     json!([
@@ -193,6 +216,7 @@ fn tools() -> Value {
                 "allow": strings("Only allow these egress destinations: example.com, *.example.com, IPv4[/len]. Default: whole internet"),
                 "allow_lan": { "type": "boolean", "description": "Also allow private networks" },
                 "offline": { "type": "boolean", "description": "No network at all" },
+                "http": { "type": "integer", "minimum": 1, "maximum": 65535, "description": "Guest port to serve at http://NAME.runt.localhost" },
             }},
         },
         {
@@ -235,12 +259,31 @@ fn tools() -> Value {
                 "egress": { "type": "boolean" },
             }},
         },
+        {
+            "name": "project_build",
+            "description": "Build the image a runt.toml describes; unchanged steps are cached.",
+            "inputSchema": { "type": "object", "properties": { "path": path } },
+        },
+        {
+            "name": "project_up",
+            "description": "Build a runt.toml and run it: create or update the project's VM (named in the file), start its services. Returns ports and URL. Rerun after edits; it redoes only what changed.",
+            "inputSchema": { "type": "object", "properties": { "path": path } },
+        },
+        {
+            "name": "project_down",
+            "description": "Stop a project's VM, or with remove=true delete it. Volumes are kept unless volumes=true (deletes their data).",
+            "inputSchema": { "type": "object", "properties": {
+                "path": path,
+                "remove": { "type": "boolean" },
+                "volumes": { "type": "boolean" },
+            }},
+        },
     ])
 }
 
 /// A `tools/call` result: text for the model, structured content for
 /// programs, `isError` for failures of the tool itself.
-fn call_tool(cfg: &Config, params: &Value) -> Value {
+fn call_tool(cfg: &Config, params: &Value, progress: Output) -> Value {
     let name = params.get("name").and_then(Value::as_str).unwrap_or("");
     let empty = Map::new();
     let args = params
@@ -255,6 +298,9 @@ fn call_tool(cfg: &Config, params: &Value) -> Value {
         "vm_stop" => vm_stop(cfg, args),
         "vm_remove" => vm_remove(cfg, args),
         "vm_logs" => vm_logs(cfg, args),
+        "project_build" => project_build(cfg, args, progress),
+        "project_up" => project_up(cfg, args, progress),
+        "project_down" => project_down(cfg, args),
         _ => Err(CliError::new(
             "unknown_tool",
             format!("unknown tool {name:?}"),
@@ -353,6 +399,11 @@ fn vm_create(cfg: &Config, args: &Map<String, Value>) -> ToolResult {
         NetMode::Nat
     };
     let egress = Egress::new(&strings_arg(args, "allow")?, allow_lan)?;
+    let http = match int_arg(args, "http")? {
+        Some(p @ 1..=65535) => Some(p as u16),
+        Some(_) => return Err(bad_arg("http must be a port number")),
+        None => None,
+    };
     let (rec, boot_ms) = ops::new_vm(ops::NewSpec {
         name: str_arg(args, "name")?.map(String::from),
         cpus: cpus as u8,
@@ -360,9 +411,13 @@ fn vm_create(cfg: &Config, args: &Map<String, Value>) -> ToolResult {
         net,
         egress,
         mounts,
+        http,
         created_by: Some(CREATOR.into()),
         ..Default::default()
     })?;
+    if http.is_some() {
+        crate::router::ensure();
+    }
     let mut text = format!("created VM {:?} (booted in {boot_ms} ms)", rec.name);
     for m in &rec.mounts {
         let ro = if m.read_only { ", read-only" } else { "" };
@@ -377,29 +432,159 @@ fn vm_create(cfg: &Config, args: &Map<String, Value>) -> ToolResult {
     } else if rec.net == NetMode::None {
         text.push_str("\nnetwork: none");
     }
+    if let Some(url) = crate::router::url(&rec) {
+        text.push_str(&format!("\nurl: {url}"));
+    }
     Ok((text, ops::created_json(&rec, boot_ms)))
 }
 
 /// Parse a mount for an agent: the source must lie under a mount root.
 fn share(cfg: &Config, spec: &str) -> Result<mounts::Mount> {
     let m = mounts::parse(spec, &cfg.cwd)?;
-    if !cfg.mount_roots.iter().any(|r| m.src.starts_with(r)) {
-        let roots: Vec<_> = cfg
-            .mount_roots
-            .iter()
-            .map(|r| r.display().to_string())
-            .collect();
+    under_root(cfg, &m.src)?;
+    Ok(m)
+}
+
+fn under_root(cfg: &Config, path: &Path) -> Result<()> {
+    if cfg.mount_roots.iter().any(|r| path.starts_with(r)) {
+        return Ok(());
+    }
+    let roots: Vec<_> = cfg
+        .mount_roots
+        .iter()
+        .map(|r| r.display().to_string())
+        .collect();
+    Err(CliError::new(
+        "not_permitted",
+        format!(
+            "{} is outside the directories this MCP server may use ({})",
+            path.display(),
+            roots.join(", ")
+        ),
+    )
+    .hint("the user can allow more with `runt mcp --mount-root DIR`"))
+}
+
+/// Load the recipe at `path` (a project directory or its runt.toml) for an
+/// agent: the project and everything it shares must lie under a mount root,
+/// and it may only reach the LAN if the operator allowed that.
+fn load_recipe(cfg: &Config, args: &Map<String, Value>) -> Result<Recipe> {
+    let path = cfg.cwd.join(str_arg(args, "path")?.unwrap_or("."));
+    let file = if path.is_dir() {
+        path.join(recipe::FILE)
+    } else {
+        path
+    };
+    let r = recipe::load(&file).map_err(with_format)?;
+    under_root(cfg, &r.dir)?;
+    for m in &r.mounts {
+        under_root(cfg, &m.src)?;
+    }
+    if r.egress.lan && !cfg.allow_lan {
         return Err(CliError::new(
             "not_permitted",
-            format!(
-                "{} is outside the directories this MCP server may share ({})",
-                m.src.display(),
-                roots.join(", ")
-            ),
+            "this runt.toml allows LAN access, which is disabled for this MCP server",
         )
-        .hint("the user can allow more with `runt mcp --mount-root DIR`"));
+        .hint("the user can enable it by starting `runt mcp --allow-lan`"));
     }
-    Ok(m)
+    Ok(r)
+}
+
+/// Agents can't run `runt skill`: a missing or invalid runt.toml comes back
+/// with the format.
+fn with_format(e: CliError) -> CliError {
+    if e.code != "no_recipe" && e.code != "invalid_recipe" {
+        return e;
+    }
+    let skill = crate::SKILL;
+    let format = skill
+        .find("## Projects: runt.toml")
+        .map(|i| &skill[i..])
+        .map(|s| &s[..s.find("\n## Managing VMs").unwrap_or(s.len())])
+        .unwrap_or_default();
+    let mut e = e;
+    e.hint = Some(format!(
+        "write runt.toml like this:\n\n{}",
+        format.trim_end()
+    ));
+    e
+}
+
+/// A failed build comes back with the end of its log.
+fn with_log(e: CliError, r: &Recipe) -> CliError {
+    if e.code != "build_failed" {
+        return e;
+    }
+    let log = std::fs::read(build::log_path(&r.dir)).unwrap_or_default();
+    let mut start = log.len().saturating_sub(BUILD_LOG_TAIL);
+    if start > 0 {
+        // Whole lines only.
+        start += log[start..]
+            .iter()
+            .position(|b| *b == b'\n')
+            .map_or(0, |i| i + 1);
+    }
+    let tail = String::from_utf8_lossy(&log[start..]);
+    let mut e = e;
+    let hint = e.hint.take().unwrap_or_default();
+    e.hint = Some(format!(
+        "{hint}\nend of the build log:\n{}",
+        tail.trim_end()
+    ));
+    e
+}
+
+/// The project's VM, if it exists, must be one the agent may use.
+fn check_project_vm(cfg: &Config, r: &Recipe) -> Result<()> {
+    if state::vm_dir(&r.name).exists() {
+        cfg.load(&r.name)?;
+    }
+    Ok(())
+}
+
+fn project_build(cfg: &Config, args: &Map<String, Value>, progress: Output) -> ToolResult {
+    let r = load_recipe(cfg, args)?;
+    let b = build::build(&r, progress).map_err(|e| with_log(e, &r))?;
+    let n = r.steps.len();
+    Ok((
+        format!(
+            "built {} in {:.1} s ({} of {n} steps cached)",
+            r.name,
+            b.ms as f64 / 1000.0,
+            b.cached
+        ),
+        json!({ "name": r.name, "steps": n, "cached": b.cached, "ms": b.ms, "log": b.log }),
+    ))
+}
+
+fn project_up(cfg: &Config, args: &Map<String, Value>, progress: Output) -> ToolResult {
+    let r = load_recipe(cfg, args)?;
+    check_project_vm(cfg, &r)?;
+    let up = project::up(&r, progress, Some(CREATOR)).map_err(|e| with_log(e, &r))?;
+    Ok((project::up_text(&up), project::up_json(&up)))
+}
+
+fn project_down(cfg: &Config, args: &Map<String, Value>) -> ToolResult {
+    let r = load_recipe(cfg, args)?;
+    check_project_vm(cfg, &r)?;
+    let rm = bool_arg(args, "remove")?;
+    let volumes = bool_arg(args, "volumes")?;
+    if volumes && !rm {
+        return Err(bad_arg("volumes=true needs remove=true"));
+    }
+    let existed = project::down(&r, rm, volumes)?;
+    let status = match (existed, rm) {
+        (false, _) => "absent",
+        (true, true) => "removed",
+        (true, false) => "stopped",
+    };
+    let mut text = format!("{}: {status}", r.name);
+    if volumes {
+        text.push_str(" (volumes deleted)");
+    } else if rm && !r.volumes.is_empty() {
+        text.push_str(" (volumes kept)");
+    }
+    Ok((text, json!({ "name": r.name, "status": status })))
 }
 
 fn running(cfg: &Config, name: &str) -> Result<state::VmRecord> {
@@ -591,7 +776,7 @@ mod tests {
     #[test]
     fn tool_schemas_are_small() {
         let t = tools();
-        assert_eq!(t.as_array().unwrap().len(), 7);
+        assert_eq!(t.as_array().unwrap().len(), 10);
         // Every schema costs context in every client: keep the total small.
         assert!(t.to_string().len() < 4000, "{}", t.to_string().len());
     }
@@ -646,9 +831,48 @@ mod tests {
     #[test]
     fn bad_arguments_are_tool_errors() {
         let c = cfg(Path::new("/"));
-        let r = call_tool(&c, &json!({ "name": "vm_exec", "arguments": { "vm": 3 } }));
+        let call = |v| call_tool(&c, &v, Output::Quiet);
+        let r = call(json!({ "name": "vm_exec", "arguments": { "vm": 3 } }));
         assert_eq!(r["isError"], true);
-        let r = call_tool(&c, &json!({ "name": "nope" }));
+        let r = call(json!({ "name": "nope" }));
         assert_eq!(r["isError"], true);
+        let r = call(json!({ "name": "vm_create", "arguments": { "http": 0 } }));
+        assert_eq!(r["isError"], true);
+    }
+
+    #[test]
+    fn projects_are_confined_to_mount_roots() {
+        let base = std::env::temp_dir().join(format!("runt-mcp-proj-{}", std::process::id()));
+        let proj = base.join("root/proj");
+        std::fs::create_dir_all(&proj).unwrap();
+        let base = base.canonicalize().unwrap();
+        let c = cfg(&base.join("root"));
+        let args = |v: Value| v.as_object().unwrap().clone();
+        let write = |text: &str| std::fs::write(proj.join("runt.toml"), text).unwrap();
+
+        write("name = \"p\"\n");
+        assert!(load_recipe(&c, &args(json!({ "path": "proj" }))).is_ok());
+        assert!(load_recipe(&c, &args(json!({ "path": "proj/runt.toml" }))).is_ok());
+        // A project outside the roots, or sharing what lies outside them.
+        let outside = cfg(&proj.join("sub"));
+        std::fs::create_dir_all(proj.join("sub")).unwrap();
+        let e = load_recipe(
+            &outside,
+            &args(json!({ "path": proj.display().to_string() })),
+        )
+        .unwrap_err();
+        assert_eq!(e.code, "not_permitted");
+        write("name = \"p\"\n[dev]\nmounts = [\"..:/up\"]\n");
+        let e = load_recipe(&cfg(&proj), &args(json!({}))).unwrap_err();
+        assert_eq!(e.code, "not_permitted");
+        // LAN access needs the operator.
+        write("name = \"p\"\n[network]\nallow_lan = true\n");
+        let e = load_recipe(&c, &args(json!({ "path": "proj" }))).unwrap_err();
+        assert_eq!(e.code, "not_permitted");
+        // No recipe: the error teaches the format.
+        let e = load_recipe(&c, &args(json!({}))).unwrap_err();
+        assert_eq!(e.code, "no_recipe");
+        assert!(e.hint.unwrap().contains("[services.web]"));
+        std::fs::remove_dir_all(&base).unwrap();
     }
 }

@@ -97,6 +97,7 @@ mounts = [".:/app"]                # live-edit the sources instead of the copy
 - `runt logs myapp -s web` shows a service's output (`-f` follows);
   `runt ls --json` shows whether services run and their last exit code.
 - A failed step exits 125 with `build_failed`; the hint names the full build log.
+- `runt schema` prints the file's JSON Schema; `runt up` checks more than it.
 - `runt down` stops the VM, `runt down --rm` removes it.
 
 ## Managing VMs

@@ -47,10 +47,27 @@ use crate::state::{self, Egress};
 use crate::volumes::{self, Volume};
 
 pub const FILE: &str = "runt.toml";
+/// JSON Schema for runt.toml, for editors and agents (`runt schema`).
+pub const SCHEMA: &str = include_str!("../../../schema/runt.schema.json");
 /// The only base image so far.
 pub const BASE: &str = "runt/base";
-/// Each step is an image layer, and each layer is a disk of the VM.
+/// Each step is an image layer.
 pub const MAX_STEPS: usize = 16;
+
+// The keys each table may have. The schema lists the same ones (a test
+// checks), so add new keys to both.
+const TOP_KEYS: &[&str] = &[
+    "name", "vm", "build", "env", "services", "http", "volumes", "network", "dev",
+];
+const VM_KEYS: &[&str] = &["cpus", "memory"];
+const BUILD_KEYS: &[&str] = &["base", "steps"];
+const RUN_KEYS: &[&str] = &["run", "cwd"];
+const COPY_KEYS: &[&str] = &["copy", "to", "exclude"];
+const SERVICE_KEYS: &[&str] = &["cmd", "cwd", "env", "restart"];
+const HTTP_KEYS: &[&str] = &["port"];
+const VOLUME_KEYS: &[&str] = &["path", "size"];
+const NETWORK_KEYS: &[&str] = &["allow", "allow_lan"];
+const DEV_KEYS: &[&str] = &["mounts", "env", "services"];
 
 /// A loaded, validated recipe, with `[dev]` applied (it is what `runt up`
 /// runs on this machine).
@@ -289,13 +306,7 @@ pub fn parse(text: &str, dir: &Path) -> Result<Recipe> {
     if doc.contains_key("deploy") {
         return Err(invalid("[deploy] isn't supported yet"));
     }
-    let top = Fields::new(
-        &doc,
-        "",
-        &[
-            "name", "vm", "build", "env", "services", "http", "volumes", "network", "dev",
-        ],
-    )?;
+    let top = Fields::new(&doc, "", TOP_KEYS)?;
     let name = top
         .str("name")?
         .ok_or_else(|| invalid("`name` is missing (it names the project and its VM)"))?;
@@ -306,11 +317,7 @@ pub fn parse(text: &str, dir: &Path) -> Result<Recipe> {
     })?;
 
     let empty = Table::new();
-    let vm = Fields::new(
-        top.table("vm")?.unwrap_or(&empty),
-        "[vm]",
-        &["cpus", "memory"],
-    )?;
+    let vm = Fields::new(top.table("vm")?.unwrap_or(&empty), "[vm]", VM_KEYS)?;
     let cpus = match vm.table.get("cpus") {
         None => 2,
         Some(Value::Integer(n)) if (1..=64).contains(n) => *n as u8,
@@ -323,11 +330,7 @@ pub fn parse(text: &str, dir: &Path) -> Result<Recipe> {
         None => 1024,
     };
 
-    let build = Fields::new(
-        top.table("build")?.unwrap_or(&empty),
-        "[build]",
-        &["base", "steps"],
-    )?;
+    let build = Fields::new(top.table("build")?.unwrap_or(&empty), "[build]", BUILD_KEYS)?;
     match build.str("base")?.as_deref() {
         None | Some(BASE) => {}
         Some(other) => {
@@ -353,11 +356,10 @@ pub fn parse(text: &str, dir: &Path) -> Result<Recipe> {
         .map(|(i, v)| {
             let at = format!("build step {}", i + 1);
             match v {
-                Value::Table(t) => step(&Fields::new(
-                    t,
-                    at,
-                    &["copy", "to", "exclude", "run", "cwd"],
-                )?),
+                Value::Table(t) => {
+                    let keys: Vec<&str> = RUN_KEYS.iter().chain(COPY_KEYS).copied().collect();
+                    step(&Fields::new(t, at, &keys)?)
+                }
                 _ => Err(invalid(format!(
                     "{at} must be a table like {{ run = \"...\" }}"
                 ))),
@@ -365,11 +367,7 @@ pub fn parse(text: &str, dir: &Path) -> Result<Recipe> {
         })
         .collect::<Result<Vec<_>>>()?;
 
-    let dev = Fields::new(
-        top.table("dev")?.unwrap_or(&empty),
-        "[dev]",
-        &["mounts", "env", "services"],
-    )?;
+    let dev = Fields::new(top.table("dev")?.unwrap_or(&empty), "[dev]", DEV_KEYS)?;
     let env = top.env("env")?;
     let mut run_env = env.clone();
     run_env.extend(dev.env("env")?);
@@ -393,7 +391,7 @@ pub fn parse(text: &str, dir: &Path) -> Result<Recipe> {
     let network = Fields::new(
         top.table("network")?.unwrap_or(&empty),
         "[network]",
-        &["allow", "allow_lan"],
+        NETWORK_KEYS,
     )?;
     let allow_lan = match network.table.get("allow_lan") {
         None => false,
@@ -409,7 +407,7 @@ pub fn parse(text: &str, dir: &Path) -> Result<Recipe> {
         .collect::<Result<Vec<_>>>()?;
     mounts::validate_set(&mounts)?;
 
-    let http = Fields::new(top.table("http")?.unwrap_or(&empty), "[http]", &["port"])?;
+    let http = Fields::new(top.table("http")?.unwrap_or(&empty), "[http]", HTTP_KEYS)?;
     let http = match http.table.get("port") {
         None => None,
         Some(Value::Integer(n)) if (1..=65535).contains(n) => Some(*n as u16),
@@ -474,7 +472,7 @@ fn volume(name: &str, v: &Value) -> Result<Volume> {
     let (path, size) = match v {
         Value::String(p) => (p.clone(), None),
         Value::Table(t) => {
-            let f = Fields::new(t, at.clone(), &["path", "size"])?;
+            let f = Fields::new(t, at.clone(), VOLUME_KEYS)?;
             let path = f
                 .str("path")?
                 .ok_or_else(|| invalid(format!("{at} needs `path`, where it is mounted")))?;
@@ -586,8 +584,6 @@ fn absolute_path(p: &str, what: &str) -> std::result::Result<String, String> {
         .collect();
     Ok(format!("/{}", parts.join("/")))
 }
-
-const SERVICE_KEYS: &[&str] = &["cmd", "cwd", "env", "restart"];
 
 /// A service from `[services.NAME]`, with `[dev.services.NAME]` on top
 /// (either may be missing, not both).
@@ -851,6 +847,54 @@ mod tests {
         assert_eq!(r.mounts[0].src, Path::new("/tmp").canonicalize().unwrap());
         assert_eq!(r.mounts[0].dst, Path::new("/app"));
         assert!(r.mounts[0].read_only);
+    }
+
+    #[test]
+    fn schema_matches_the_parser() {
+        let s: serde_json::Value = serde_json::from_str(SCHEMA).unwrap();
+        let keys = |v: &serde_json::Value| {
+            let mut k: Vec<String> = v["properties"]
+                .as_object()
+                .unwrap()
+                .keys()
+                .cloned()
+                .collect();
+            k.sort();
+            k
+        };
+        let want = |list: &[&str]| {
+            let mut k: Vec<String> = list.iter().map(|s| s.to_string()).collect();
+            k.sort();
+            k
+        };
+        let (top, defs) = (&s, &s["definitions"]);
+        let p = &top["properties"];
+        assert_eq!(keys(top), want(TOP_KEYS));
+        assert_eq!(keys(&p["vm"]), want(VM_KEYS));
+        assert_eq!(keys(&p["build"]), want(BUILD_KEYS));
+        assert_eq!(keys(&defs["runStep"]), want(RUN_KEYS));
+        assert_eq!(keys(&defs["copyStep"]), want(COPY_KEYS));
+        assert_eq!(keys(&defs["serviceFields"]), want(SERVICE_KEYS));
+        assert_eq!(keys(&p["http"]), want(HTTP_KEYS));
+        let volume = &p["volumes"]["additionalProperties"]["oneOf"][1];
+        assert_eq!(keys(volume), want(VOLUME_KEYS));
+        assert_eq!(keys(&p["network"]), want(NETWORK_KEYS));
+        assert_eq!(keys(&p["dev"]), want(DEV_KEYS));
+
+        // Limits and choices.
+        assert_eq!(p["build"]["properties"]["steps"]["maxItems"], MAX_STEPS);
+        assert_eq!(
+            p["build"]["properties"]["base"]["enum"],
+            serde_json::json!([BASE])
+        );
+        assert_eq!(p["volumes"]["maxProperties"], volumes::MAX_VOLUMES);
+        let restart = &defs["serviceFields"]["properties"]["restart"]["enum"];
+        for r in restart.as_array().unwrap() {
+            let r: Restart = serde_json::from_value(r.clone()).unwrap();
+            assert_ne!(serde_json::to_value(r).unwrap(), serde_json::Value::Null);
+        }
+        assert_eq!(restart.as_array().unwrap().len(), 3);
+        assert_eq!(p["vm"]["properties"]["cpus"]["maximum"], 64);
     }
 
     #[test]

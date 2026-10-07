@@ -33,6 +33,7 @@ $ runt exec --json nimble-shrew -- sh -c 'echo hi; exit 3'
 | `runt logs VM [--egress] [-s SERVICE [-f]]` | Guest console log, refused network connections, or a service's output |
 | `runt up` / `runt down [--rm [--volumes]]` | Run the project in `runt.toml` / stop (or remove) its VM |
 | `runt build` | Build `runt.toml`'s image without running it |
+| `runt schema` | JSON Schema of `runt.toml` |
 | `runt volume ls` / `runt volume rm VM [NAME]` | List or delete project volumes |
 | `runt mcp` | MCP server for AI agents (see below) |
 | `runt skill [--install]` | Print or install the agent skill (see below) |
@@ -128,6 +129,17 @@ logs: runt logs myapp -s web
   with an HTTP port runs; `runt new --http PORT` does the same for any VM.
 - **Images build on runt's Debian base** (`runt/base`). Other bases, secrets
   and `runt deploy` are on the way.
+- **Editors can check `runt.toml`.** [`schema/runt.schema.json`](schema/runt.schema.json)
+  (also `runt schema`) gives completion, hover docs and errors in editors
+  that read JSON Schema for TOML, such as VS Code with Even Better TOML: put
+  this line at the top of the file.
+
+  ```toml
+  #:schema https://raw.githubusercontent.com/runt-sh/runt/main/schema/runt.schema.json
+  ```
+
+  `runt up` checks more than the schema can, such as overlapping paths and
+  whether shared directories exist.
 
 ## AI agents
 
@@ -137,8 +149,11 @@ Code skill in `~/.claude/skills/runt/`; for other agents, paste it into their
 instructions.
 
 For agents that use tools, `runt mcp` is a [Model Context Protocol](https://modelcontextprotocol.io)
-server on stdio with seven small tools: `vm_create`, `vm_exec`, `vm_list`,
-`vm_start`, `vm_stop`, `vm_remove` and `vm_logs`.
+server on stdio with ten small tools: `vm_create`, `vm_exec`, `vm_list`,
+`vm_start`, `vm_stop`, `vm_remove` and `vm_logs` for VMs, and
+`project_build`, `project_up` and `project_down` for `runt.toml` projects.
+Builds report each step as MCP progress, and a failed build returns the end
+of its log. Without a `runt.toml`, `project_up` answers with the format.
 
 ```sh
 # Claude Code, from your project directory
@@ -150,11 +165,15 @@ Other clients take the usual config: `{"command": "runt", "args": ["mcp"]}`.
 You stay in charge of what an agent can reach on your machine:
 
 - **Shares:** agents may share only the directory `runt mcp` was started in
-  (or those given with `--mount-root DIR`).
-- **LAN:** agents can't open LAN access unless you start the server with
-  `--allow-lan`.
-- **VMs:** agents see and manage only the VMs they created. Use `--vm NAME`
-  to also hand them an existing VM, or `--all-vms` to give them all of yours.
+  (or those given with `--mount-root DIR`). The same goes for projects: a
+  `runt.toml` must be in one of those directories, and so must the folders
+  its `[dev] mounts` share.
+- **LAN:** agents can't open LAN access, by tool or by `runt.toml`, unless
+  you start the server with `--allow-lan`.
+- **VMs:** agents see and manage only the VMs they created, including
+  project VMs from `project_up`. Use `--vm NAME` to also hand them an
+  existing VM (such as a project you ran with `runt up`), or `--all-vms` to
+  give them all of yours.
 - **Output:** `vm_exec` keeps the first and last 32 KiB of each output
   stream and has a timeout (default 120 s).
 - **Workdir:** commands start in the same directory as the server when that
