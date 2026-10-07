@@ -161,7 +161,7 @@ fn copy_failed(i: usize, e: &io::Error) -> CliError {
     )
 }
 
-/// The build VM; removed (with its shared directory) when dropped.
+/// The build VM; removed (with its shared directories) when dropped.
 struct BuildVm {
     name: String,
     io: PathBuf,
@@ -170,8 +170,18 @@ struct BuildVm {
 impl Drop for BuildVm {
     fn drop(&mut self) {
         let _ = vm::remove(&self.name, true);
-        let _ = fs::remove_dir_all(&self.io);
+        remove_dirs(&self.io);
     }
+}
+
+/// The build VM's shares: `io` and the cached layers beside it.
+fn layers_dir(io: &Path) -> PathBuf {
+    io.with_extension("layers")
+}
+
+fn remove_dirs(io: &Path) {
+    let _ = fs::remove_dir_all(io);
+    let _ = fs::remove_dir_all(layers_dir(io));
 }
 
 /// Build steps `from..` in a build VM, leaving their layers in the cache.
@@ -184,7 +194,7 @@ fn run_steps(
 ) -> Result<()> {
     let name = format!("runt-build-{}", std::process::id());
     let io = state::cache_dir().join("tmp").join(&name);
-    let _ = fs::remove_dir_all(&io);
+    remove_dirs(&io);
     fs::DirBuilder::new()
         .recursive(true)
         .mode(0o700)
@@ -193,6 +203,8 @@ fn run_steps(
         name: name.clone(),
         io: io.clone(),
     };
+    let layers = layers_dir(&io);
+    vm::link_layers(&layers, keys[..from].iter().map(|k| state::layer_path(k)))?;
     for (i, step) in r.steps.iter().enumerate().skip(from) {
         if let Step::Copy { paths, exclude, .. } = step {
             let mut f = io::BufWriter::new(File::create(io.join(format!("{i}.tar")))?);
@@ -217,13 +229,20 @@ fn run_steps(
         cpus: cpus.max(r.cpus),
         mem_mib: r.mem_mib.max(2048),
         net: NetMode::Nat,
-        mounts: vec![Mount {
-            src: io.canonicalize()?,
-            dst: PathBuf::from("/runt/io"),
-            read_only: false,
-        }],
+        mounts: vec![
+            Mount {
+                src: io.canonicalize()?,
+                dst: PathBuf::from("/runt/io"),
+                read_only: false,
+            },
+            // Read-only: the links share their files with the cache.
+            Mount {
+                src: layers.canonicalize()?,
+                dst: PathBuf::from("/runt/layers"),
+                read_only: true,
+            },
+        ],
         created_by: Some("build".into()),
-        disks: keys[..from].iter().map(|k| state::layer_path(k)).collect(),
         ..Default::default()
     })?;
     let script = |args: Vec<String>| {
@@ -332,7 +351,7 @@ fn on_interrupt_remove(name: &str, io: &Path) {
             INTERRUPTED.store(true, Ordering::SeqCst);
             eprintln!("\nrunt: interrupted; removing the build VM");
             let _ = vm::remove(&name, true);
-            let _ = fs::remove_dir_all(&io);
+            remove_dirs(&io);
             std::process::exit(128 + sig);
         }
     });
@@ -382,11 +401,6 @@ pub fn gc() {
     }
     for rec in state::list().unwrap_or_default() {
         keep.extend(rec.layers.iter().cloned());
-        for d in &rec.disks {
-            if let Some(stem) = d.file_stem().and_then(|s| s.to_str()) {
-                keep.insert(stem.to_string());
-            }
-        }
     }
     let Ok(entries) = fs::read_dir(state::layers_dir()) else {
         return;

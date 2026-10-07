@@ -14,6 +14,15 @@ use std::fmt;
 use std::os::fd::RawFd;
 use std::path::PathBuf;
 
+/// How many devices runt may add to a VM: disks, shares and the network
+/// card together. libkrun gives each virtio device its own interrupt line;
+/// on x86_64 it has 11 (IRQs 5-15) and always takes 4 of them (console,
+/// vsock, balloon, entropy). arm64 has 128.
+#[cfg(target_arch = "x86_64")]
+pub const DEVICE_SLOTS: usize = 7;
+#[cfg(not(target_arch = "x86_64"))]
+pub const DEVICE_SLOTS: usize = 64;
+
 /// Everything needed to boot one VM.
 #[derive(Debug, Clone)]
 pub struct VmConfig {

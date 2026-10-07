@@ -75,6 +75,10 @@ PORT = "8000"
 [services.web]                     # restart = "always" (default),
 cmd = "flask --app app run --host 0.0.0.0 --port $PORT"  # "on-failure", "never"
 cwd = "/app"
+[http]                             # URL in `runt up --json` ("url")
+port = 8000
+[volumes]                          # persistent: survive new images
+data = { path = "/data", size = "1G" }
 [network]                          # optional: what the running VM may reach
 allow = ["api.github.com"]         # (same rules as --allow)
 [dev]                              # applied by `runt up` on this machine
@@ -85,7 +89,11 @@ mounts = [".:/app"]                # live-edit the sources instead of the copy
   under `to` (`copy = "src"` gives `/app/src`). `exclude` takes gitignore-style
   names (`node_modules`, `*.log`, `/build`).
 - A new image recreates the VM with a fresh disk; anything the app must keep
-  belongs in a `[dev] mounts` folder. Other changes restart only what changed.
+  (databases, uploads) belongs on a volume. Other changes restart only what
+  changed. `runt down --rm --volumes` also deletes volumes.
+- With `[http] port`, the app is at `http://myapp.runt.localhost:7080` (exact
+  URL in the JSON). Prefer it over the forwarded port in what you tell the
+  user. `runt new --http PORT` gives any VM such a URL.
 - `runt logs myapp -s web` shows a service's output (`-f` follows);
   `runt ls --json` shows whether services run and their last exit code.
 - A failed step exits 125 with `build_failed`; the hint names the full build log.

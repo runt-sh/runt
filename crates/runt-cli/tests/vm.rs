@@ -606,6 +606,7 @@ struct Project(std::path::PathBuf, String);
 impl Drop for Project {
     fn drop(&mut self) {
         runt(&["rm", "-f", &self.1]);
+        runt(&["volume", "rm", &self.1]);
         let _ = std::fs::remove_dir_all(&self.0);
     }
 }
@@ -624,7 +625,7 @@ fn recipes_build_and_run() {
     // step names this test run to start from an empty cache. Layer 1 also
     // deletes a base file and makes a tree; layer 3 replaces part
     // of it, so whiteouts and opaque directories have to survive stacking,
-    // both fresh and (on the rebuild below) from cached layer disks.
+    // both fresh and (on the rebuild below) from cached layer files.
     std::fs::write(
         dir.join("runt.toml"),
         format!(
@@ -751,4 +752,151 @@ fn failed_builds_clean_up_and_resume() {
     recipe("true");
     let v = json(&runt_in(&dir, &["build", "--json"]));
     assert_eq!(v["cached"], 1);
+}
+
+/// A GET through the local URL router: (status code, body).
+fn get_via_router(url: &str) -> (u16, String) {
+    use std::io::Read;
+    let rest = url.strip_prefix("http://").unwrap();
+    let (host, port) = rest.split_once(':').unwrap_or((rest, "80"));
+    let mut s = std::net::TcpStream::connect(("127.0.0.1", port.parse::<u16>().unwrap())).unwrap();
+    write!(
+        s,
+        "GET / HTTP/1.1\r\nHost: {host}:{port}\r\nConnection: close\r\n\r\n"
+    )
+    .unwrap();
+    let mut resp = String::new();
+    s.read_to_string(&mut resp).unwrap();
+    let code = resp.get(9..12).and_then(|c| c.parse().ok()).unwrap_or(0);
+    let body = resp
+        .split_once("\r\n\r\n")
+        .map(|(_, b)| b.to_string())
+        .unwrap_or_default();
+    (code, body)
+}
+
+#[test]
+#[ignore]
+fn volumes_and_local_urls() {
+    use std::time::{Duration, Instant};
+
+    let name = format!("test-vol-{}", std::process::id());
+    let dir = std::env::temp_dir().join(&name);
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let p = Project(dir.clone(), name.clone());
+    // Counts its visits in a file on the volume.
+    std::fs::write(
+        dir.join("serve.pl"),
+        r#"use IO::Socket::INET;
+my $s = IO::Socket::INET->new(LocalAddr => "127.0.0.1", LocalPort => 8000, Listen => 5, ReuseAddr => 1) or die;
+while (my $c = $s->accept) {
+  my $req = ""; while (my $l = <$c>) { $req .= $l; last if $l eq "\r\n"; }
+  my ($host) = $req =~ /^Host: (\S+)/mi;
+  open(my $f, "+>>", "/data/visits"); print $f "x"; seek($f, 0, 0); my $n = length(<$f>); close $f;
+  my $body = "visit $n via $host\n";
+  print $c "HTTP/1.1 200 OK\r\nContent-Length: " . length($body) . "\r\nConnection: close\r\n\r\n$body";
+  close $c;
+}
+"#,
+    )
+    .unwrap();
+    let recipe = |size: &str| {
+        let text = format!(
+            r#"
+name = "{name}"
+[vm]
+memory = "512M"
+[build]
+steps = [{{ run = "echo {name} > /name" }}, {{ copy = "serve.pl", to = "/app" }}]
+[services.web]
+cmd = "perl /app/serve.pl"
+[http]
+port = 8000
+[volumes]
+data = {{ path = "/data", size = "{size}" }}
+"#
+        );
+        std::fs::write(dir.join("runt.toml"), text).unwrap();
+    };
+    recipe("64M");
+    let v = json(&runt_in(&dir, &["up", "--json"]));
+    assert_eq!(v["action"], "created");
+    assert_eq!(v["volumes"][0]["path"], "/data");
+    let url = v["url"].as_str().expect("a local URL").to_string();
+    assert!(
+        url.starts_with(&format!("http://{name}.runt.localhost")),
+        "{url}"
+    );
+    let visit = |n: u32| {
+        let want = format!("visit {n} via {}", url.trim_start_matches("http://"));
+        let t = Instant::now();
+        loop {
+            let (code, body) = get_via_router(&url);
+            if code == 200 || t.elapsed() > Duration::from_secs(5) {
+                assert_eq!((code, body.trim()), (200, want.as_str()));
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+    };
+    visit(1);
+    visit(2);
+
+    // A new image means a new VM; the volume's data carries over.
+    std::fs::write(
+        dir.join("serve.pl"),
+        std::fs::read_to_string(dir.join("serve.pl")).unwrap() + "# v2\n",
+    )
+    .unwrap();
+    let v = json(&runt_in(&dir, &["up", "--json"]));
+    assert_eq!(v["action"], "recreated");
+    visit(3);
+
+    // Growing restarts the VM with the bigger volume; shrinking is refused
+    // without touching it.
+    recipe("128M");
+    let v = json(&runt_in(&dir, &["up", "--json"]));
+    assert_eq!(
+        (v["action"].as_str(), v["reason"].as_str()),
+        (Some("restarted"), Some("volumes changed"))
+    );
+    let o = runt(&["exec", &name, "--", "df", "-m", "--output=size", "/data"]);
+    let mb: u32 = stdout(&o).lines().nth(1).unwrap().trim().parse().unwrap();
+    assert!(mb > 100, "{mb}M");
+    visit(4);
+    recipe("64M");
+    let o = runt_in(&dir, &["up", "--json"]);
+    let e: serde_json::Value = serde_json::from_slice(&o.stderr).unwrap();
+    assert_eq!(e["error"]["code"], "volume_shrink");
+    recipe("128M");
+    visit(5);
+
+    // The router explains what it can't route.
+    let other = url.replace(&name, "no-such-vm");
+    let (code, body) = get_via_router(&other);
+    assert_eq!(code, 404);
+    assert!(body.contains("no VM named"), "{body}");
+
+    // Volumes outlive `down --rm` unless asked.
+    json(&runt_in(&dir, &["down", "--rm", "--json"]));
+    let vols = json(&runt(&["volume", "ls", "--json"]));
+    assert!(
+        vols.as_array()
+            .unwrap()
+            .iter()
+            .any(|v| v["vm"] == name.as_str())
+    );
+    json(&runt_in(&dir, &["up", "--json"]));
+    visit(6);
+    json(&runt_in(&dir, &["down", "--rm", "--volumes", "--json"]));
+    let vols = json(&runt(&["volume", "ls", "--json"]));
+    assert!(
+        !vols
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|v| v["vm"] == name.as_str())
+    );
+    drop(p);
 }

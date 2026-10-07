@@ -7,10 +7,13 @@
 //!                                 console.log  guest console
 //!                                 vmm.log      supervisor stderr
 //!                                 egress.log   connections the policy refused
+//! $XDG_STATE_HOME/runt/volumes/<name>/...      volumes (see volumes.rs)
 //! $XDG_RUNTIME_DIR/runt/<name>/agent.sock       agent socket (libkrun listens)
 //!                              ready.sock, events.sock, ports.json, sandbox.json
+//! $XDG_RUNTIME_DIR/runt/router.json            the local URL router (router.rs)
 //! $XDG_CACHE_HOME/runt/{vmlinux,initramfs.cpio,images/base.erofs}
 //!                      layers/<key>.erofs     image layers built from recipes
+//!                      vm-layers/<name>/<i>.erofs  links to a running VM's layers
 //!                      projects/<id>.json     each project's latest build
 //! ```
 
@@ -46,14 +49,17 @@ pub struct VmRecord {
     /// Image layers on top of the base, bottom first (keys in `layers/`).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub layers: Vec<String>,
-    /// More read-only disks, attached after the layers but not mounted.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub disks: Vec<PathBuf>,
     /// Environment for services and `runt exec`.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub env: BTreeMap<String, String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub services: Vec<crate::recipe::ServiceDef>,
+    /// Writable disks after the VM's own, mounted where they say.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub volumes: Vec<crate::volumes::Volume>,
+    /// The guest port served at http://NAME.runt.localhost.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub http: Option<u16>,
 }
 
 /// What a NAT VM's network may reach beyond the default (public internet).
@@ -152,8 +158,16 @@ pub fn egress_log_path(name: &str) -> PathBuf {
     vm_dir(name).join("egress.log")
 }
 
+fn state_dir() -> PathBuf {
+    xdg("XDG_STATE_HOME", ".local/state").join("runt")
+}
+
 pub fn vms_dir() -> PathBuf {
-    xdg("XDG_STATE_HOME", ".local/state").join("runt/vms")
+    state_dir().join("vms")
+}
+
+pub fn volumes_dir() -> PathBuf {
+    state_dir().join("volumes")
 }
 
 pub fn cache_dir() -> PathBuf {
@@ -166,6 +180,12 @@ pub fn layers_dir() -> PathBuf {
 
 pub fn layer_path(key: &str) -> PathBuf {
     layers_dir().join(format!("{key}.erofs"))
+}
+
+/// A running VM's image layers, hard-linked from `layers/` and shared with
+/// it read-only.
+pub fn vm_layers_dir(name: &str) -> PathBuf {
+    cache_dir().join("vm-layers").join(name)
 }
 
 pub fn projects_dir() -> PathBuf {
@@ -207,7 +227,7 @@ pub fn vm_runtime_dir(name: &str) -> PathBuf {
     runtime_dir().join(name)
 }
 
-fn runtime_dir() -> PathBuf {
+pub fn runtime_dir() -> PathBuf {
     match std::env::var_os("XDG_RUNTIME_DIR") {
         Some(v) if !v.is_empty() => PathBuf::from(v).join("runt"),
         // SAFETY: getuid never fails.

@@ -23,7 +23,7 @@ $ runt exec --json nimble-shrew -- sh -c 'echo hi; exit 3'
 
 | Command | What it does |
 | --- | --- |
-| `runt new [NAME] [--cpus N] [--mem 1G] [--mount SRC[:DST][:ro]]` | Create and boot a VM |
+| `runt new [NAME] [--cpus N] [--mem 1G] [--mount SRC[:DST][:ro]] [--http PORT]` | Create and boot a VM |
 | `runt exec VM [-t] [-e K=V] [-w DIR] -- CMD...` | Run a command; exits with its exit code |
 | `runt shell VM` | Interactive shell |
 | `runt ls` | List VMs |
@@ -31,8 +31,9 @@ $ runt exec --json nimble-shrew -- sh -c 'echo hi; exit 3'
 | `runt rm [-f] VM` | Delete a VM and its disk |
 | `runt port VM` | Ports forwarded from the VM to this machine |
 | `runt logs VM [--egress] [-s SERVICE [-f]]` | Guest console log, refused network connections, or a service's output |
-| `runt up` / `runt down [--rm]` | Run the project in `runt.toml` / stop (or remove) its VM |
+| `runt up` / `runt down [--rm [--volumes]]` | Run the project in `runt.toml` / stop (or remove) its VM |
 | `runt build` | Build `runt.toml`'s image without running it |
+| `runt volume ls` / `runt volume rm VM [NAME]` | List or delete project volumes |
 | `runt mcp` | MCP server for AI agents (see below) |
 | `runt skill [--install]` | Print or install the agent skill (see below) |
 
@@ -43,8 +44,8 @@ to stderr.
 ## Projects: `runt.toml`
 
 A `runt.toml` at the root of a project describes its VM: how to build the
-image, which services to keep running, and what the network may reach.
-`runt up` builds it and runs it.
+image, which services to keep running, where its data lives, and what the
+network may reach. `runt up` builds it and runs it.
 
 ```toml
 name = "myapp"                     # the VM's name
@@ -66,6 +67,12 @@ PORT = "8000"
 cmd = "flask --app app run --host 0.0.0.0 --port $PORT"
 cwd = "/app"
 
+[http]                             # served at http://myapp.runt.localhost:7080
+port = 8000
+
+[volumes]                          # kept when the VM is rebuilt
+data = { path = "/data", size = "1G" }
+
 [network]                          # optional, like `runt new --allow`
 allow = ["api.github.com"]
 
@@ -82,7 +89,9 @@ building myapp (2 steps)
 built myapp in 20.3 s (0 of 2 steps cached)
 myapp is up: created and booted in 152 ms
   service web: running (pid 54)
+  volume data at /data (1G)
   http://127.0.0.1:8000 -> port 8000 in the VM
+url: http://myapp.runt.localhost:7080
 logs: runt logs myapp -s web
 ```
 
@@ -103,11 +112,22 @@ logs: runt logs myapp -s web
   default; or `"on-failure"`, `"never"`), with backoff. Their output goes to
   `runt logs VM -s NAME`.
 - **`runt up` changes as little as it can.** Changed services restart on
-  their own, CPU, memory, mount and network changes reboot the VM, and a new
-  image replaces it with a fresh disk. Keep data that must survive in a
-  `[dev] mounts` folder for now (volumes are planned).
-- **Images build on runt's Debian base** (`runt/base`). Other bases, volumes,
-  secrets and `runt deploy` are on the way.
+  their own; CPU, memory, mount, volume and network changes reboot the VM;
+  and a new image replaces it with a fresh disk.
+- **Volumes keep data.** Each `[volumes]` entry is an ext4 disk mounted at
+  `path`, which belongs to the project rather than the VM: it survives new
+  images and `runt down --rm`, and goes away with `runt down --rm --volumes`
+  or `runt volume rm`. Raise `size` to grow one (it can't shrink). A volume
+  starts empty and hides whatever the image has at its path.
+- **Local URLs.** With `[http] port`, the app is served at
+  `http://NAME.runt.localhost:7080` (`:80` is used, and left out of the URL,
+  where your system lets runt bind it). Browsers and curl send `*.localhost`
+  to this machine without any DNS setup, so each project gets its own origin
+  and cookies whatever port it uses. Subdomains (`api.myapp.runt.localhost`)
+  reach the same app. A small router process serves these URLs while any VM
+  with an HTTP port runs; `runt new --http PORT` does the same for any VM.
+- **Images build on runt's Debian base** (`runt/base`). Other bases, secrets
+  and `runt deploy` are on the way.
 
 ## AI agents
 
@@ -166,6 +186,9 @@ guest, so the VM can't remount it writable.
 - **Trust:** treat files the VM writes into a share as untrusted, just as you
   would files from any sandboxed program. For example, symlinks it creates
   are followed by programs on your machine.
+- **How many:** on x86_64, a VM has room for 4 shares, or 3 shares and
+  volumes together for a VM built from `runt.toml` (libkrun has 11 interrupt
+  lines for devices there). Share a common parent folder to need fewer.
 
 ## Networking
 
@@ -255,8 +278,9 @@ default; on Debian/Ubuntu add yourself to the `kvm` group).
   ([smolvm-network](https://crates.io/crates/smolvm-network), wrapped by
   `crates/runt-net`) inside each VM's process.
 - **The guest runs runt's own minimal kernel** (`images/kernel/`). Its root
-  filesystem is a read-only, compressed erofs base image with a per-VM ext4
-  disk layered over it.
+  filesystem is a read-only, compressed erofs base image, plus any image
+  layers built from `runt.toml` (erofs files on one read-only share), with a
+  per-VM ext4 disk layered over them.
 - **runt-agent is the guest's PID 1** (`crates/runt-agent`). It serves exec
   sessions to the host over vsock, using a small flow-controlled protocol
   (`crates/runt-proto`).

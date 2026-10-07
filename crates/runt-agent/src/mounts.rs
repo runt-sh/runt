@@ -1,7 +1,9 @@
-//! Shared folders: virtio-fs filesystems from the host, mounted at boot.
+//! Shared folders (virtio-fs filesystems from the host) and volumes (ext4
+//! disks), mounted at boot.
 //!
-//! The supervisor passes `runt.fs=<tag>:<hex(path)>[:ro],...` on the kernel
-//! command line. Paths are hex-encoded so any byte sequence survives.
+//! The supervisor passes `runt.fs=<tag>:<hex(path)>[:ro],...` and
+//! `runt.vols=<hex(path)>,...` on the kernel command line. Paths are
+//! hex-encoded so any byte sequence survives.
 
 use std::io;
 
@@ -26,21 +28,39 @@ pub fn parse(value: &str) -> (Vec<GuestMount>, Vec<String>) {
     (mounts, errors)
 }
 
+/// Parse the value of `runt.vols`: one hex-encoded absolute path per volume.
+pub fn parse_paths(value: &str) -> (Vec<String>, Vec<String>) {
+    let mut paths = Vec::new();
+    let mut errors = Vec::new();
+    for entry in value.split(',') {
+        match decode_path(entry) {
+            Some(p) => paths.push(p),
+            // Keep the rest in place: each volume's disk follows from its
+            // position.
+            None => {
+                errors.push(format!("bad runt.vols entry {entry:?}"));
+                paths.push(String::new());
+            }
+        }
+    }
+    (paths, errors)
+}
+
+fn decode_path(hex: &str) -> Option<String> {
+    let p = String::from_utf8(hex_decode(hex)?).ok()?;
+    (p.starts_with('/') && p != "/" && !p.split('/').any(|c| c == "..")).then_some(p)
+}
+
 fn parse_entry(entry: &str) -> Option<GuestMount> {
     let mut parts = entry.split(':');
     let tag = parts.next()?;
-    let dst = String::from_utf8(hex_decode(parts.next()?)?).ok()?;
+    let dst = decode_path(parts.next()?)?;
     let read_only = match parts.next() {
         None => false,
         Some("ro") => true,
         Some(_) => return None,
     };
-    if parts.next().is_some()
-        || tag.is_empty()
-        || !tag.bytes().all(|b| b.is_ascii_alphanumeric())
-        || !dst.starts_with('/')
-        || dst.split('/').any(|c| c == "..")
-    {
+    if parts.next().is_some() || tag.is_empty() || !tag.bytes().all(|b| b.is_ascii_alphanumeric()) {
         return None;
     }
     Some(GuestMount {
@@ -68,6 +88,27 @@ pub fn mount_all(mounts: &[GuestMount]) {
                 "runt-agent: warning: cannot mount {} at {}: {e}",
                 m.tag, m.dst
             );
+        }
+    }
+}
+
+/// Mount a volume's disk at `path`. If that fails, an empty read-only
+/// tmpfs goes there instead: the app should fail to write its data rather
+/// than quietly write it to the VM's own disk, which a new image replaces.
+pub fn mount_volume(dev: &str, path: &str) {
+    if path.is_empty() {
+        return;
+    }
+    let flags = libc::MS_NOATIME | libc::MS_NOSUID | libc::MS_NODEV;
+    let mounted =
+        crate::boot::mkdir_p(path).and_then(|()| crate::boot::mount(dev, path, "ext4", flags, ""));
+    match mounted {
+        // A fresh ext4 has lost+found, which trips up programs that want an
+        // empty directory (initdb, for one). fsck recreates it if needed.
+        Ok(()) => drop(std::fs::remove_dir(format!("{path}/lost+found"))),
+        Err(e) => {
+            eprintln!("runt-agent: warning: cannot mount the volume at {path}: {e}");
+            let _ = crate::boot::mount("tmpfs", path, "tmpfs", flags | libc::MS_RDONLY, "size=4k");
         }
     }
 }
@@ -113,6 +154,13 @@ mod tests {
                 },
             ]
         );
+    }
+
+    #[test]
+    fn parses_volume_paths() {
+        let (p, errs) = parse_paths(&format!("{},zz,{}", hex("/data"), hex("/")));
+        assert_eq!(p, vec!["/data", "", ""]);
+        assert_eq!(errs.len(), 2);
     }
 
     #[test]

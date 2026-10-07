@@ -7,8 +7,8 @@ from an agent, see `skills/runt/SKILL.md` (also printed by `runt skill`).
 
 | Path | What |
 | --- | --- |
-| `crates/runt-cli` | The `runt` binary: commands, VM lifecycle (`vm.rs`), on-disk state (`state.rs`), MCP server (`mcp.rs`), shared operations (`ops.rs`), `runt.toml` (`recipe.rs`), the image builder (`build.rs`, guest half `build.sh`, inputs via `tar.rs`), `runt up`/`down` (`project.rs`) |
-| `crates/runt-agent` | PID 1 inside the guest (static musl): boot (overlay of base, recipe layers and the VM's disk), mounts, networking, exec server, port watcher, services |
+| `crates/runt-cli` | The `runt` binary: commands, VM lifecycle (`vm.rs`), on-disk state (`state.rs`), MCP server (`mcp.rs`), shared operations (`ops.rs`), `runt.toml` (`recipe.rs`), the image builder (`build.rs`, guest half `build.sh`, inputs via `tar.rs`), `runt up`/`down` (`project.rs`), volumes (`volumes.rs`), the `*.runt.localhost` router (`router.rs`) |
+| `crates/runt-agent` | PID 1 inside the guest (static musl): boot (overlay of base, recipe layers and the VM's disk), volumes and shares, networking, exec server, port watcher, services |
 | `crates/runt-proto` | Host/guest wire protocol: framed, multiplexed, credit-based flow control |
 | `crates/runt-vmm` | libkrun bindings (loaded with dlopen at runtime) |
 | `crates/runt-net` | Userspace networking and egress policy; the only crate that names `smolvm-network` |
@@ -51,6 +51,10 @@ to `crates/runt-agent` only reach VMs after `make initramfs`.
 - **Layer keys are a cache contract.** Anything that changes what a build
   step produces must change its key (`build::layer_keys`); bump `FORMAT` in
   `build.rs` when `build.sh` changes what layers contain.
+- **Devices are scarce on x86_64.** libkrun gives each virtio device an IRQ
+  and has 11 there, 4 of them taken (`runt_vmm::DEVICE_SLOTS`). Disks,
+  shares and the NIC share the rest, which is why image layers are files on
+  one share rather than disks. Check `vm::check_devices` before adding one.
 - **smolvm-network is pinned exactly.** Read its source before relying on
   behaviour, and keep its types inside `runt-net`.
 
@@ -60,6 +64,9 @@ to `crates/runt-agent` only reach VMs after `make initramfs`.
   `runt ls` afterwards for leftovers.
 - Build layers are shared by every project with the same steps. Tests that
   assert on caching should make their first step unique to the run.
+- A VM test that sets `[http] port` starts the per-user router, which exits
+  about 30 s after the last such VM stops. Volumes outlive their VM: remove
+  them in the test's cleanup (`runt volume rm NAME`).
 - Don't kill processes with `pkill -f` patterns that also match your own
   shell's command line.
 - Benchmarks must remove the VMs they create.

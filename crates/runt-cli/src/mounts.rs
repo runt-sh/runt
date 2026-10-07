@@ -15,7 +15,7 @@ pub const MAX_MOUNTS: usize = 16;
 const MAX_CMDLINE: usize = 1536;
 
 /// Guest paths a share must not cover: the guest needs its own.
-const RESERVED: &[&str] = &[
+pub const RESERVED: &[&str] = &[
     "/bin", "/boot", "/dev", "/etc", "/lib", "/lib32", "/lib64", "/libx32", "/proc", "/run",
     "/sbin", "/sys", "/usr", "/var",
 ];
@@ -140,17 +140,20 @@ pub fn cmdline(mounts: &[Mount]) -> Option<String> {
         .iter()
         .enumerate()
         .map(|(i, m)| {
-            let hex: String = m
-                .dst
-                .as_os_str()
-                .as_encoded_bytes()
-                .iter()
-                .map(|b| format!("{b:02x}"))
-                .collect();
-            format!("{}:{hex}{}", tag(i), if m.read_only { ":ro" } else { "" })
+            let ro = if m.read_only { ":ro" } else { "" };
+            format!("{}:{}{ro}", tag(i), hex(m.dst.as_os_str()))
         })
         .collect();
     Some(format!("runt.fs={}", entries.join(",")))
+}
+
+/// A guest path as the agent reads it from the kernel command line.
+pub fn hex(path: impl AsRef<std::ffi::OsStr>) -> String {
+    path.as_ref()
+        .as_encoded_bytes()
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect()
 }
 
 /// Fail early if the guest command line would be too long.
