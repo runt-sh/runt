@@ -7,14 +7,15 @@ from an agent, see `skills/runt/SKILL.md` (also printed by `runt skill`).
 
 | Path | What |
 | --- | --- |
-| `crates/runt-cli` | The `runt` binary: commands, VM lifecycle (`vm.rs`), on-disk state (`state.rs`), MCP server (`mcp.rs`), shared operations (`ops.rs`), `runt.toml` (`recipe.rs`), the image builder (`build.rs`, guest half `build.sh`, inputs via `tar.rs`), `runt up`/`down` (`project.rs`), volumes (`volumes.rs`), the `*.runt.localhost` router (`router.rs`) |
+| `crates/runt-cli` | The `runt` binary: commands, VM lifecycle (`vm.rs`), on-disk state (`state.rs`), MCP server (`mcp.rs`, including project tools), shared operations (`ops.rs`), `runt.toml` (`recipe.rs`), the image builder (`build.rs`, guest half `build.sh`, inputs via `tar.rs`), `runt up`/`down` (`project.rs`), volumes (`volumes.rs`), the `*.runt.localhost` router (`router.rs`) |
 | `crates/runt-agent` | PID 1 inside the guest (static musl): boot (overlay of base, recipe layers and the VM's disk), volumes and shares, networking, exec server, port watcher, services |
 | `crates/runt-proto` | Host/guest wire protocol: framed, multiplexed, credit-based flow control |
 | `crates/runt-vmm` | libkrun bindings (loaded with dlopen at runtime) |
 | `crates/runt-net` | Userspace networking and egress policy; the only crate that names `smolvm-network` |
 | `crates/runt-sandbox` | Landlock + seccomp confinement of each VM's host process |
 | `images/` | Guest kernel config, initramfs and Debian base image builds |
-| `skills/runt/SKILL.md` | Agent skill, compiled into the binary |
+| `skills/runt/SKILL.md` | Agent skill, compiled into the binary; `runt mcp` also returns its runt.toml section |
+| `schema/runt.schema.json` | JSON Schema of `runt.toml`, compiled into the binary (`runt schema`) |
 
 ## Build and test
 
@@ -46,8 +47,14 @@ to `crates/runt-agent` only reach VMs after `make initramfs`.
   only, the host's loopback is never reachable, and MCP agents only reach
   what the operator granted. Changes there need a VM test proving the
   boundary.
+- **`runt.toml` has two definitions.** The parser (`recipe.rs`) and the JSON
+  Schema (`schema/runt.schema.json`) must agree: a new key goes in both, and
+  `schema_matches_the_parser` checks the key lists and limits.
 - **Old `vm.json` files must keep loading:** new `VmRecord` fields get
   `#[serde(default)]`.
+- **Builds may run concurrently** (`runt mcp` runs tool calls on threads).
+  Build VMs are named per build, and `build::lock` serializes builds and
+  `up`/`down` of one project.
 - **Layer keys are a cache contract.** Anything that changes what a build
   step produces must change its key (`build::layer_keys`); bump `FORMAT` in
   `build.rs` when `build.sh` changes what layers contain.

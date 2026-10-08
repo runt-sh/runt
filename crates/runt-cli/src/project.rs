@@ -10,8 +10,9 @@
 use std::time::{Duration, Instant};
 
 use runt_proto::ServiceStatus;
+use serde_json::{Value, json};
 
-use crate::build::{self, Built};
+use crate::build::{self, Built, Output};
 use crate::client;
 use crate::error::{CliError, Result};
 use crate::ops;
@@ -35,7 +36,9 @@ pub struct Up {
     pub services: Vec<ServiceStatus>,
 }
 
-pub fn up(r: &Recipe, echo: bool) -> Result<Up> {
+/// Build and run `r`. A VM it creates is marked `created_by`.
+pub fn up(r: &Recipe, out: Output, created_by: Option<&str>) -> Result<Up> {
+    let _lock = build::lock(r, out)?;
     // Refuse what we can't do before building or touching the VM.
     volumes::check(&r.name, &r.dir, &r.volumes)?;
     vm::check_devices(&VmRecord {
@@ -45,7 +48,7 @@ pub fn up(r: &Recipe, echo: bool) -> Result<Up> {
         mounts: r.mounts.clone(),
         ..Default::default()
     })?;
-    let built = build::build(r, echo)?;
+    let built = build::build_locked(r, out)?;
     let spec = || ops::NewSpec {
         name: Some(r.name.clone()),
         cpus: r.cpus,
@@ -59,7 +62,7 @@ pub fn up(r: &Recipe, echo: bool) -> Result<Up> {
         services: r.services.clone(),
         volumes: r.volumes.clone(),
         http: r.http,
-        ..Default::default()
+        created_by: created_by.map(String::from),
     };
     let prepare_volumes = || volumes::prepare(&r.name, &r.dir, &r.volumes);
     let existing = state::vm_dir(&r.name)
@@ -169,6 +172,7 @@ fn finish(
 /// `runt down`: stop the project's VM, or remove it with `rm` (and its
 /// volumes too with `rm_volumes`). Returns false when there was no VM.
 pub fn down(r: &Recipe, rm: bool, rm_volumes: bool) -> Result<bool> {
+    let _lock = build::lock(r, Output::Quiet)?;
     if !state::vm_dir(&r.name).exists() {
         if rm_volumes && volumes::owner(&r.name).as_deref() == Some(r.dir.as_path()) {
             volumes::remove(&r.name, None)?;
@@ -207,4 +211,54 @@ pub fn describe(s: &ServiceStatus) -> String {
         n => format!(", restarted {n} times"),
     };
     format!("{}: {state}{restarts}", s.name)
+}
+
+/// What `runt up` did, as JSON.
+pub fn up_json(up: &Up) -> Value {
+    let maps = ports::read(&up.rec.name);
+    json!({
+        "name": up.rec.name, "status": "running", "action": up.action,
+        "reason": up.reason, "boot_ms": up.boot_ms,
+        "build": { "layers": up.built.layers, "cached": up.built.cached,
+                   "ms": up.built.ms, "log": up.built.log },
+        "services": ops::services_json(&up.services),
+        "url": router::url(&up.rec), "volumes": up.rec.volumes,
+        "ports": maps.iter()
+            .map(|m| json!({ "guest": m.guest, "host": m.host, "url": m.url() }))
+            .collect::<Vec<_>>(),
+    })
+}
+
+/// What `runt up` did, for people (and agents).
+pub fn up_text(up: &Up) -> String {
+    let name = &up.rec.name;
+    let how = match (up.action, up.reason, up.boot_ms) {
+        ("unchanged", ..) => "already up to date".to_string(),
+        (a, Some(why), Some(ms)) => format!("{a} ({why}) and booted in {ms} ms"),
+        (a, Some(why), None) => format!("{a} ({why})"),
+        (a, None, Some(ms)) => format!("{a} and booted in {ms} ms"),
+        (a, None, None) => a.to_string(),
+    };
+    let mut lines = vec![format!("{name} is up: {how}")];
+    if up.action == "recreated" {
+        lines.push("  (the VM's own disk starts fresh with a new image)".into());
+    }
+    for s in &up.services {
+        lines.push(format!("  service {}", describe(s)));
+    }
+    for v in &up.rec.volumes {
+        lines.push(format!(
+            "  volume {} at {} ({})",
+            v.name,
+            v.path,
+            volumes::format_size(v.size_mib)
+        ));
+    }
+    for m in ports::read(name) {
+        lines.push(format!("  {} -> port {} in the VM", m.url(), m.guest));
+    }
+    if let Some(url) = router::url(&up.rec) {
+        lines.push(format!("url: {url}"));
+    }
+    lines.join("\n")
 }

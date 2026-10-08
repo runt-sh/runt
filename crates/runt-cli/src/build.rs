@@ -12,9 +12,11 @@
 use std::collections::HashSet;
 use std::fs::{self, File};
 use std::io::{self, Write};
+use std::os::fd::AsRawFd;
 use std::os::unix::fs::{DirBuilderExt, MetadataExt};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Mutex, Once};
 use std::time::{Duration, Instant, SystemTime};
 
 use serde_json::json;
@@ -48,19 +50,28 @@ pub struct Built {
     pub log: PathBuf,
 }
 
-/// Where build progress goes: always the build log, and stderr unless the
-/// caller wants JSON.
-struct Log {
-    file: Option<File>,
-    echo: bool,
+/// Where build progress goes besides the build log.
+#[derive(Clone, Copy)]
+pub enum Output<'a> {
+    /// Nowhere else (`--json`).
+    Quiet,
+    /// Everything, to stderr, as it happens.
+    Stderr,
+    /// Only each step's line as it starts: (step index, steps, line).
+    Steps(&'a (dyn Fn(usize, usize, &str) + Sync)),
 }
 
-impl Log {
+struct Log<'a> {
+    file: Option<File>,
+    out: Output<'a>,
+}
+
+impl Log<'_> {
     fn write(&mut self, d: &[u8]) {
         if let Some(f) = self.file.as_mut() {
             let _ = f.write_all(d);
         }
-        if self.echo {
+        if let Output::Stderr = self.out {
             let mut e = io::stderr().lock();
             let _ = e.write_all(d).and_then(|_| e.flush());
         }
@@ -69,18 +80,60 @@ impl Log {
     fn line(&mut self, s: &str) {
         self.write(format!("{s}\n").as_bytes());
     }
+
+    /// The line that starts step `i` of `n`.
+    fn step(&mut self, i: usize, n: usize, s: &str) {
+        self.line(s);
+        if let Output::Steps(f) = self.out {
+            f(i, n, s);
+        }
+    }
 }
 
-pub fn build(r: &Recipe, echo: bool) -> Result<Built> {
+/// The build log of the project in `dir`.
+pub fn log_path(dir: &Path) -> PathBuf {
+    state::projects_dir().join(format!("{}.log", project_id(dir)))
+}
+
+/// Held while building or changing a project's VM, so that two runs for
+/// one project (two terminals, or an agent and a person) take turns.
+pub struct ProjectLock(#[allow(dead_code)] File);
+
+pub fn lock(r: &Recipe, out: Output) -> Result<ProjectLock> {
+    fs::create_dir_all(state::projects_dir())?;
+    let path = state::projects_dir().join(format!("{}.lock", project_id(&r.dir)));
+    let f = File::create(path)?;
+    let flock = |how| {
+        // SAFETY: flock(2) on a file we own.
+        unsafe { libc::flock(f.as_raw_fd(), how) == 0 }
+    };
+    if !flock(libc::LOCK_EX | libc::LOCK_NB) {
+        if let Output::Stderr = out {
+            eprintln!("runt: waiting for another build of {}", r.name);
+        }
+        if !flock(libc::LOCK_EX) {
+            return Err(io::Error::last_os_error().into());
+        }
+    }
+    Ok(ProjectLock(f))
+}
+
+pub fn build(r: &Recipe, out: Output) -> Result<Built> {
+    let _lock = lock(r, out)?;
+    build_locked(r, out)
+}
+
+/// `build`, for a caller that holds the project's lock.
+pub fn build_locked(r: &Recipe, out: Output) -> Result<Built> {
     let t0 = Instant::now();
     let assets = state::assets()?;
     for d in [state::layers_dir(), state::projects_dir()] {
         fs::create_dir_all(d)?;
     }
-    let log_path = state::projects_dir().join(format!("{}.log", project_id(&r.dir)));
+    let log_path = log_path(&r.dir);
     let mut log = Log {
         file: File::create(&log_path).ok(),
-        echo,
+        out,
     };
     let n = r.steps.len();
     log.line(&format!(
@@ -95,7 +148,7 @@ pub fn build(r: &Recipe, echo: bool) -> Result<Built> {
         .take_while(|k| state::layer_path(k).is_file())
         .count();
     for (i, s) in r.steps.iter().enumerate().take(cached) {
-        log.line(&format!("[{}/{n}] {} (cached)", i + 1, s.describe()));
+        log.step(i, n, &format!("[{}/{n}] {} (cached)", i + 1, s.describe()));
     }
     let result = if cached < n {
         run_steps(r, &keys, cached, &mut log, &log_path)
@@ -161,16 +214,70 @@ fn copy_failed(i: usize, e: &io::Error) -> CliError {
     )
 }
 
+/// Prefix of build VM names; the rest is the building process's pid and a
+/// sequence number (`runt mcp` may run several builds at once).
+const BUILD_VM: &str = "runt-build-";
+
 /// The build VM; removed (with its shared directories) when dropped.
 struct BuildVm {
     name: String,
     io: PathBuf,
 }
 
+impl BuildVm {
+    fn new() -> BuildVm {
+        static SEQ: AtomicUsize = AtomicUsize::new(0);
+        let n = SEQ.fetch_add(1, Ordering::Relaxed);
+        let name = format!("{BUILD_VM}{}-{n}", std::process::id());
+        let io = state::cache_dir().join("tmp").join(&name);
+        lock_active().push((name.clone(), io.clone()));
+        on_interrupt_remove();
+        BuildVm { name, io }
+    }
+}
+
 impl Drop for BuildVm {
     fn drop(&mut self) {
         let _ = vm::remove(&self.name, true);
         remove_dirs(&self.io);
+        lock_active().retain(|(n, _)| *n != self.name);
+    }
+}
+
+/// Build VMs of this process, for cleaning up after an interrupt.
+static ACTIVE: Mutex<Vec<(String, PathBuf)>> = Mutex::new(Vec::new());
+
+fn lock_active() -> std::sync::MutexGuard<'static, Vec<(String, PathBuf)>> {
+    ACTIVE.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// Remove this process's build VMs; for when it is about to exit with
+/// builds still running (`runt mcp` when its client goes away).
+pub fn abort_all() {
+    INTERRUPTED.store(true, Ordering::SeqCst);
+    for (name, io) in lock_active().drain(..) {
+        let _ = vm::remove(&name, true);
+        remove_dirs(&io);
+    }
+}
+
+/// Remove build VMs whose process is gone (killed outright, say).
+fn remove_orphans() {
+    for rec in state::list().unwrap_or_default() {
+        let Some(pid) = rec
+            .name
+            .strip_prefix(BUILD_VM)
+            .and_then(|r| r.split('-').next())
+            .and_then(|p| p.parse::<u32>().ok())
+        else {
+            continue;
+        };
+        if rec.created_by.as_deref() != Some("build") || Path::new(&format!("/proc/{pid}")).exists()
+        {
+            continue;
+        }
+        let _ = vm::remove(&rec.name, true);
+        remove_dirs(&state::cache_dir().join("tmp").join(&rec.name));
     }
 }
 
@@ -192,17 +299,14 @@ fn run_steps(
     log: &mut Log,
     log_path: &Path,
 ) -> Result<()> {
-    let name = format!("runt-build-{}", std::process::id());
-    let io = state::cache_dir().join("tmp").join(&name);
+    remove_orphans();
+    let guard = BuildVm::new();
+    let (name, io) = (guard.name.clone(), guard.io.clone());
     remove_dirs(&io);
     fs::DirBuilder::new()
         .recursive(true)
         .mode(0o700)
         .create(&io)?;
-    let guard = BuildVm {
-        name: name.clone(),
-        io: io.clone(),
-    };
     let layers = layers_dir(&io);
     vm::link_layers(&layers, keys[..from].iter().map(|k| state::layer_path(k)))?;
     for (i, step) in r.steps.iter().enumerate().skip(from) {
@@ -219,7 +323,6 @@ fn run_steps(
             }
         }
     }
-    on_interrupt_remove(&name, &io);
 
     let cpus = std::thread::available_parallelism()
         .map(|n| n.get().min(8))
@@ -286,7 +389,7 @@ fn run_steps(
         if failed.is_some() {
             break;
         }
-        log.line(&format!("[{}/{n}] {}", i + 1, step.describe()));
+        log.step(i, n, &format!("[{}/{n}] {}", i + 1, step.describe()));
         let args = match step {
             Step::Run { cmd, cwd } => {
                 let mut a = vec!["run".into(), i.to_string(), cwd.clone(), cmd.clone()];
@@ -339,21 +442,21 @@ fn run_steps(
 
 static INTERRUPTED: AtomicBool = AtomicBool::new(false);
 
-/// Ctrl-C during a build: remove the build VM instead of leaving it behind.
-fn on_interrupt_remove(name: &str, io: &Path) {
-    let Ok(mut sigs) = crate::term::signal_pipe(&[libc::SIGINT, libc::SIGTERM, libc::SIGHUP])
-    else {
-        return;
-    };
-    let (name, io) = (name.to_string(), io.to_path_buf());
-    std::thread::spawn(move || {
-        if let Some(sig) = crate::term::next_signal(&mut sigs) {
-            INTERRUPTED.store(true, Ordering::SeqCst);
-            eprintln!("\nrunt: interrupted; removing the build VM");
-            let _ = vm::remove(&name, true);
-            remove_dirs(&io);
-            std::process::exit(128 + sig);
-        }
+/// Ctrl-C during a build: remove build VMs instead of leaving them behind.
+fn on_interrupt_remove() {
+    static HANDLER: Once = Once::new();
+    HANDLER.call_once(|| {
+        let Ok(mut sigs) = crate::term::signal_pipe(&[libc::SIGINT, libc::SIGTERM, libc::SIGHUP])
+        else {
+            return;
+        };
+        std::thread::spawn(move || {
+            if let Some(sig) = crate::term::next_signal(&mut sigs) {
+                eprintln!("\nrunt: interrupted; removing build VMs");
+                abort_all();
+                std::process::exit(128 + sig);
+            }
+        });
     });
 }
 
